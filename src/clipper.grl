@@ -1,0 +1,4204 @@
+module clipper;
+use math;
+
+// Polygon clipping: a port of Clipper2's Vatti engine (https://github.com/AngusJohnson/Clipper2,
+// Boost Software License 1.0, Copyright Angus Johnson 2010-2025), kept function for function so
+// results match the C++ library. Pointers become indices into the arenas of the Clip state; NIL
+// stands for nullptr. The double-precision API (ClipperD) scales coordinates by a power of two
+// and rounds them to integers, as upstream, then runs the integer engine.
+
+const NIL: u64 = 18446744073709551615;
+
+// Vertex flags
+const VF_OPEN_START: u64 = 1;
+const VF_OPEN_END: u64 = 2;
+const VF_LOCAL_MAX: u64 = 4;
+const VF_LOCAL_MIN: u64 = 8;
+
+pub const CLIP_NONE: u64 = 0;
+pub const CLIP_INTERSECTION: u64 = 1;
+pub const CLIP_UNION: u64 = 2;
+pub const CLIP_DIFFERENCE: u64 = 3;
+pub const CLIP_XOR: u64 = 4;
+pub const FILL_EVEN_ODD: u64 = 0;
+pub const FILL_NON_ZERO: u64 = 1;
+pub const FILL_POSITIVE: u64 = 2;
+pub const FILL_NEGATIVE: u64 = 3;
+const SUBJECT: u64 = 0;
+const CLIP: u64 = 1;
+const JOIN_NONE: u64 = 0;
+const JOIN_LEFT: u64 = 1;
+const JOIN_RIGHT: u64 = 2;
+
+pub struct Clip {
+    // vertices
+    vx: i64[], vy: i64[], vnext: u64[], vprev: u64[], vflags: u64[],
+    // local minima (vertex, polytype, open), in insertion order, then sorted
+    lm_v: u64[], lm_type: u64[], lm_open: bool[], lm_order: u64[], lm_cur: u64, lm_sorted: bool,
+    // output points
+    ox: i64[], oy: i64[], onext: u64[], oprev: u64[], orec: u64[], ohorz: u64[],
+    // output records
+    r_owner: u64[], r_front: u64[], r_back: u64[], r_pts: u64[], r_splits: u64[][],
+    r_rsplit: u64[], r_left: i64[], r_top: i64[], r_right: i64[], r_bottom: i64[],
+    r_px: i64[][], r_py: i64[][], r_open: bool[], r_polypath: u64[],
+    // active edges
+    ebx: i64[], eby: i64[], etx: i64[], ety: i64[], ecx: i64[], edx: f64[], ewdx: i64[],
+    ewc: i64[], ewc2: i64[], erec: u64[], eprev: u64[], enext: u64[], epsel: u64[],
+    ensel: u64[], ejump: u64[], evtop: u64[], elm: u64[], eleft: bool[], ejoin: u64[],
+    // intersections, horizontal segments and joins
+    in_x: i64[], in_y: i64[], in_e1: u64[], in_e2: u64[],
+    hs_left: u64[], hs_right: u64[], hs_ltr: bool[],
+    hj_op1: u64[], hj_op2: u64[],
+    // state
+    scan: i64[], actives: u64, sel: u64, cliptype: u64, fillrule: u64, bot_y: i64,
+    using_polytree: bool, preserve_collinear: bool, reverse_solution: bool,
+    has_open_paths: bool, succeeded: bool, error_code: u64
+}
+
+fn dbl_max() -> f64 {
+    return f64_from_bits(9218868437227405311);
+}
+// C nearbyint in the default rounding mode: nearest, ties to even (|x| < 2^52 is exact here).
+fn nearbyint(x: f64) -> i64 {
+    f := x.floor();
+    d := x - f;
+    mut r = i64(f);
+    if d > 0.5 {
+        r += 1;
+    } else {
+        if d == 0.5 {
+            if (r & 1) != 0 {
+                r += 1;
+            }
+        }
+    }
+    return r;
+}
+// C std::round: nearest, ties away from zero.
+fn round_away(x: f64) -> i64 {
+    if x < 0.0 {
+        return 0 - round_away(0.0 - x);
+    }
+    f := x.floor();
+    if x - f >= 0.5 {
+        return i64(f) + 1;
+    }
+    return i64(f);
+}
+
+fn is_odd(v: i64) -> bool {
+    return (v & 1) != 0;
+}
+fn is_hot<a>(c: (&a Clip), e: u64) -> bool {
+    return c.erec[e] != NIL;
+}
+fn is_open<a>(c: (&a Clip), e: u64) -> bool {
+    return c.lm_open[c.elm[e]];
+}
+fn is_open_end_v<a>(c: (&a Clip), v: u64) -> bool {
+    return (c.vflags[v] & (VF_OPEN_START | VF_OPEN_END)) != 0;
+}
+fn is_open_end<a>(c: (&a Clip), e: u64) -> bool {
+    return is_open_end_v(&c, c.evtop[e]);
+}
+fn prev_hot_edge<a>(c: (&a Clip), e: u64) -> u64 {
+    mut p = c.eprev[e];
+    while (p != NIL) && (is_open(&c, p) || (is_hot(&c, p) == false)) {
+        p = c.eprev[p];
+    }
+    return p;
+}
+fn is_front<a>(c: (&a Clip), e: u64) -> bool {
+    return e == c.r_front[c.erec[e]];
+}
+fn is_invalid_path<a>(c: (&a Clip), op: u64) -> bool {
+    return (op == NIL) || (c.onext[op] == op);
+}
+// Dx: 0 is vertical; -DBL_MAX heads right, +DBL_MAX heads left (horizontals).
+fn get_dx(x1: i64, y1: i64, x2: i64, y2: i64) -> f64 {
+    dy := f64(y2 - y1);
+    if dy != 0.0 {
+        return f64(x2 - x1) / dy;
+    }
+    if x2 > x1 {
+        return 0.0 - dbl_max();
+    }
+    return dbl_max();
+}
+fn top_x<a>(c: (&a Clip), e: u64, y: i64) -> i64 {
+    if (y == c.ety[e]) || (c.etx[e] == c.ebx[e]) {
+        return c.etx[e];
+    }
+    if y == c.eby[e] {
+        return c.ebx[e];
+    }
+    return c.ebx[e] + nearbyint(c.edx[e] * f64(y - c.eby[e]));
+}
+fn is_horizontal<a>(c: (&a Clip), e: u64) -> bool {
+    return c.ety[e] == c.eby[e];
+}
+fn heading_right_horz<a>(c: (&a Clip), e: u64) -> bool {
+    return c.edx[e] == 0.0 - dbl_max();
+}
+fn heading_left_horz<a>(c: (&a Clip), e: u64) -> bool {
+    return c.edx[e] == dbl_max();
+}
+fn poly_type<a>(c: (&a Clip), e: u64) -> u64 {
+    return c.lm_type[c.elm[e]];
+}
+fn same_poly_type<a>(c: (&a Clip), e1: u64, e2: u64) -> bool {
+    return c.lm_type[c.elm[e1]] == c.lm_type[c.elm[e2]];
+}
+fn set_dx<a>(c: (&a mut Clip), e: u64) {
+    d := get_dx(c.ebx[e], c.eby[e], c.etx[e], c.ety[e]);
+    c.edx[e] = d;
+}
+fn next_vertex<a>(c: (&a Clip), e: u64) -> u64 {
+    if c.ewdx[e] > 0 {
+        return c.vnext[c.evtop[e]];
+    }
+    return c.vprev[c.evtop[e]];
+}
+fn prev_prev_vertex<a>(c: (&a Clip), e: u64) -> u64 {
+    if c.ewdx[e] > 0 {
+        return c.vprev[c.vprev[c.evtop[e]]];
+    }
+    return c.vnext[c.vnext[c.evtop[e]]];
+}
+fn extract_from_sel<a>(c: (&a mut Clip), e: u64) -> u64 {
+    res := c.ensel[e];
+    p := c.epsel[e];
+    if res != NIL {
+        c.epsel[res] = p;
+    }
+    c.ensel[p] = res;
+    return res;
+}
+fn insert1_before2_in_sel<a>(c: (&a mut Clip), e1: u64, e2: u64) {
+    p := c.epsel[e2];
+    c.epsel[e1] = p;
+    if p != NIL {
+        c.ensel[p] = e1;
+    }
+    c.ensel[e1] = e2;
+    c.epsel[e2] = e1;
+}
+fn is_maxima_v<a>(c: (&a Clip), v: u64) -> bool {
+    return (c.vflags[v] & VF_LOCAL_MAX) != 0;
+}
+fn is_maxima<a>(c: (&a Clip), e: u64) -> bool {
+    return is_maxima_v(&c, c.evtop[e]);
+}
+fn curr_y_maxima_vertex_open<a>(c: (&a Clip), e: u64) -> u64 {
+    mut r = c.evtop[e];
+    if c.ewdx[e] > 0 {
+        while (c.vy[c.vnext[r]] == c.vy[r]) && ((c.vflags[r] & (VF_OPEN_END | VF_LOCAL_MAX)) == 0) {
+            r = c.vnext[r];
+        }
+    } else {
+        while (c.vy[c.vprev[r]] == c.vy[r]) && ((c.vflags[r] & (VF_OPEN_END | VF_LOCAL_MAX)) == 0) {
+            r = c.vprev[r];
+        }
+    }
+    if is_maxima_v(&c, r) == false {
+        return NIL;
+    }
+    return r;
+}
+fn curr_y_maxima_vertex<a>(c: (&a Clip), e: u64) -> u64 {
+    mut r = c.evtop[e];
+    if c.ewdx[e] > 0 {
+        while c.vy[c.vnext[r]] == c.vy[r] {
+            r = c.vnext[r];
+        }
+    } else {
+        while c.vy[c.vprev[r]] == c.vy[r] {
+            r = c.vprev[r];
+        }
+    }
+    if is_maxima_v(&c, r) == false {
+        return NIL;
+    }
+    return r;
+}
+fn maxima_pair<a>(c: (&a Clip), e: u64) -> u64 {
+    mut e2 = c.enext[e];
+    while e2 != NIL {
+        if c.evtop[e2] == c.evtop[e] {
+            return e2;
+        }
+        e2 = c.enext[e2];
+    }
+    return NIL;
+}
+fn point_count<a>(c: (&a Clip), op: u64) -> u64 {
+    mut p = op;
+    mut n: u64 = 0;
+    loop {
+        p = c.onext[p];
+        n += 1;
+        if p == op {
+            break;
+        }
+    }
+    return n;
+}
+fn new_outpt<a>(c: (&a mut Clip), x: i64, y: i64, rec: u64) -> u64 {
+    n := c.ox.len();
+    c.ox.push(x);
+    c.oy.push(y);
+    c.onext.push(n);
+    c.oprev.push(n);
+    c.orec.push(rec);
+    c.ohorz.push(NIL);
+    return n;
+}
+fn duplicate_op<a>(c: (&a mut Clip), op: u64, insert_after: bool) -> u64 {
+    x := c.ox[op];
+    y := c.oy[op];
+    rec := c.orec[op];
+    r := new_outpt(&mut c, x, y, rec);
+    if insert_after {
+        nx := c.onext[op];
+        c.onext[r] = nx;
+        c.oprev[nx] = r;
+        c.oprev[r] = op;
+        c.onext[op] = r;
+    } else {
+        pv := c.oprev[op];
+        c.oprev[r] = pv;
+        c.onext[pv] = r;
+        c.onext[r] = op;
+        c.oprev[op] = r;
+    }
+    return r;
+}
+// Unlinks op (arena entries are never reused) and returns its successor.
+fn dispose_outpt<a>(c: (&a mut Clip), op: u64) -> u64 {
+    nx := c.onext[op];
+    pv := c.oprev[op];
+    c.onext[pv] = nx;
+    c.oprev[nx] = pv;
+    return nx;
+}
+fn dispose_outpts<a>(c: (&a mut Clip), rec: u64) {
+    c.r_pts[rec] = NIL;
+}
+
+// 128-bit-exact sign comparison of a*b against c*d (the reference uses __int128).
+fn mul_parts(a: i64, b: i64) -> u64[] {
+    // |a|*|b| as (hi, lo) 64-bit words, plus the sign (-1, 0, 1)
+    mut sign: i64 = 1;
+    mut ua = a;
+    mut ub = b;
+    if ua < 0 {
+        ua = 0 - ua;
+        sign = 0 - sign;
+    }
+    if ub < 0 {
+        ub = 0 - ub;
+        sign = 0 - sign;
+    }
+    if (ua == 0) || (ub == 0) {
+        sign = 0;
+    }
+    x := u64(ua);
+    y := u64(ub);
+    m: u64 := 4294967295;
+    x1 := (x & m) * (y & m);
+    x2 := (x >> 32) * (y & m) + (x1 >> 32);
+    x3 := (x & m) * (y >> 32) + (x2 & m);
+    lo := ((x3 & m) << 32) | (x1 & m);
+    hi := (x >> 32) * (y >> 32) + (x2 >> 32) + (x3 >> 32);
+    return u64[hi, lo, u64(sign + 1)];
+}
+// Sign of a*b - c*d, exactly.
+fn cmp_products(a: i64, b: i64, c: i64, d: i64) -> i64 {
+    ab := mul_parts(a, b);
+    cd := mul_parts(c, d);
+    sab := i64(ab[2]) - 1;
+    scd := i64(cd[2]) - 1;
+    if sab != scd {
+        if sab > scd {
+            return 1;
+        }
+        return -1;
+    }
+    if sab == 0 {
+        return 0;
+    }
+    mut r: i64 = 0;
+    if ab[0] != cd[0] {
+        if ab[0] > cd[0] {
+            r = 1;
+        } else {
+            r = -1;
+        }
+    } else {
+        if ab[1] != cd[1] {
+            if ab[1] > cd[1] {
+                r = 1;
+            } else {
+                r = -1;
+            }
+        }
+    }
+    if sab > 0 {
+        return r;
+    }
+    return 0 - r;
+}
+fn products_equal(a: i64, b: i64, c: i64, d: i64) -> bool {
+    return cmp_products(a, b, c, d) == 0;
+}
+// Points are passed as x/y pairs packed in Pt to stay within six parameters.
+pub struct Pt {
+    x: i64,
+    y: i64
+}
+fn cross_sign(p1: Pt, p2: Pt, p3: Pt) -> i64 {
+    return cmp_products(p2.x - p1.x, p3.y - p2.y, p2.y - p1.y, p3.x - p2.x);
+}
+fn is_collinear(p1: Pt, shared: Pt, p2: Pt) -> bool {
+    return products_equal(shared.x - p1.x, p2.y - shared.y, shared.y - p1.y, p2.x - shared.x);
+}
+fn cross_product(p1: Pt, p2: Pt, p3: Pt) -> f64 {
+    return f64(p2.x - p1.x) * f64(p3.y - p2.y) - f64(p2.y - p1.y) * f64(p3.x - p2.x);
+}
+fn dot_product(p1: Pt, p2: Pt, p3: Pt) -> f64 {
+    return f64(p2.x - p1.x) * f64(p3.x - p2.x) + f64(p2.y - p1.y) * f64(p3.y - p2.y);
+}
+fn sqr(v: f64) -> f64 {
+    return v * v;
+}
+fn distance_sqr(p1: Pt, p2: Pt) -> f64 {
+    return sqr(f64(p1.x - p2.x)) + sqr(f64(p1.y - p2.y));
+}
+fn perp_dist_sqrd(pt: Pt, l1: Pt, l2: Pt) -> f64 {
+    a := f64(pt.x - l1.x);
+    b := f64(pt.y - l1.y);
+    c := f64(l2.x - l1.x);
+    d := f64(l2.y - l1.y);
+    if (c == 0.0) && (d == 0.0) {
+        return 0.0;
+    }
+    return sqr(a * d - c * b) / (c * c + d * d);
+}
+fn opt<a>(c: (&a Clip), op: u64) -> Pt {
+    return Pt { x: c.ox[op], y: c.oy[op] };
+}
+fn vpt<a>(c: (&a Clip), v: u64) -> Pt {
+    return Pt { x: c.vx[v], y: c.vy[v] };
+}
+
+fn set_sides<a>(c: (&a mut Clip), rec: u64, start: u64, end: u64) {
+    c.r_front[rec] = start;
+    c.r_back[rec] = end;
+}
+fn swap_outrecs<a>(c: (&a mut Clip), e1: u64, e2: u64) {
+    or1 := c.erec[e1];
+    or2 := c.erec[e2];
+    if or1 == or2 {
+        f := c.r_front[or1];
+        b := c.r_back[or1];
+        c.r_front[or1] = b;
+        c.r_back[or1] = f;
+        return ();
+    }
+    if or1 != NIL {
+        if e1 == c.r_front[or1] {
+            c.r_front[or1] = e2;
+        } else {
+            c.r_back[or1] = e2;
+        }
+    }
+    if or2 != NIL {
+        if e2 == c.r_front[or2] {
+            c.r_front[or2] = e1;
+        } else {
+            c.r_back[or2] = e1;
+        }
+    }
+    c.erec[e1] = or2;
+    c.erec[e2] = or1;
+}
+fn area_op<a>(c: (&a Clip), op: u64) -> f64 {
+    mut r = 0.0;
+    mut p = op;
+    loop {
+        pv := c.oprev[p];
+        r += f64(c.oy[pv] + c.oy[p]) * f64(c.ox[pv] - c.ox[p]);
+        p = c.onext[p];
+        if p == op {
+            break;
+        }
+    }
+    return r * 0.5;
+}
+fn area_triangle(p1: Pt, p2: Pt, p3: Pt) -> f64 {
+    return f64(p3.y + p1.y) * f64(p3.x - p1.x) + f64(p1.y + p2.y) * f64(p1.x - p2.x)
+        + f64(p2.y + p3.y) * f64(p2.x - p3.x);
+}
+fn reverse_outpts<a>(c: (&a mut Clip), op: u64) {
+    if op == NIL {
+        return ();
+    }
+    mut p1 = op;
+    loop {
+        p2 := c.onext[p1];
+        pv := c.oprev[p1];
+        c.onext[p1] = pv;
+        c.oprev[p1] = p2;
+        p1 = p2;
+        if p1 == op {
+            break;
+        }
+    }
+}
+fn swap_sides<a>(c: (&a mut Clip), rec: u64) {
+    f := c.r_front[rec];
+    b := c.r_back[rec];
+    c.r_front[rec] = b;
+    c.r_back[rec] = f;
+    nx := c.onext[c.r_pts[rec]];
+    c.r_pts[rec] = nx;
+}
+fn real_outrec<a>(c: (&a Clip), rec_in: u64) -> u64 {
+    mut rec = rec_in;
+    while (rec != NIL) && (c.r_pts[rec] == NIL) {
+        rec = c.r_owner[rec];
+    }
+    return rec;
+}
+fn is_valid_owner<a>(c: (&a Clip), rec: u64, test_in: u64) -> bool {
+    mut t = test_in;
+    while (t != NIL) && (t != rec) {
+        t = c.r_owner[t];
+    }
+    return t == NIL;
+}
+fn uncouple_outrec<a>(c: (&a mut Clip), e: u64) {
+    rec := c.erec[e];
+    if rec == NIL {
+        return ();
+    }
+    f := c.r_front[rec];
+    b := c.r_back[rec];
+    c.erec[f] = NIL;
+    c.erec[b] = NIL;
+    c.r_front[rec] = NIL;
+    c.r_back[rec] = NIL;
+}
+fn abs_i(v: i64) -> i64 {
+    if v < 0 {
+        return 0 - v;
+    }
+    return v;
+}
+fn pts_really_close(p1: Pt, p2: Pt) -> bool {
+    return (abs_i(p1.x - p2.x) < 2) && (abs_i(p1.y - p2.y) < 2);
+}
+fn is_very_small_triangle<a>(c: (&a Clip), op: u64) -> bool {
+    nx := c.onext[op];
+    pv := c.oprev[op];
+    return (c.onext[nx] == pv)
+        && (pts_really_close(opt(&c, pv), opt(&c, nx)) || pts_really_close(opt(&c, op), opt(&c, nx))
+            || pts_really_close(opt(&c, op), opt(&c, pv)));
+}
+fn is_valid_closed_path<a>(c: (&a Clip), op: u64) -> bool {
+    return (op != NIL) && (c.onext[op] != op) && (c.onext[op] != c.oprev[op])
+        && (is_very_small_triangle(&c, op) == false);
+}
+fn outrec_is_ascending<a>(c: (&a Clip), e: u64) -> bool {
+    return e == c.r_front[c.erec[e]];
+}
+fn edges_adjacent_in_ael<a>(c: (&a Clip), n: u64) -> bool {
+    e1 := c.in_e1[n];
+    e2 := c.in_e2[n];
+    return (c.enext[e1] == e2) || (c.eprev[e1] == e2);
+}
+fn is_joined<a>(c: (&a Clip), e: u64) -> bool {
+    return c.ejoin[e] != JOIN_NONE;
+}
+fn set_owner<a>(c: (&a mut Clip), rec: u64, new_owner: u64) {
+    ro := real_outrec(&c, c.r_owner[new_owner]);
+    c.r_owner[new_owner] = ro;
+    mut t = new_owner;
+    while (t != NIL) && (t != rec) {
+        t = c.r_owner[t];
+    }
+    if t != NIL {
+        o := c.r_owner[rec];
+        c.r_owner[new_owner] = o;
+    }
+    c.r_owner[rec] = new_owner;
+}
+
+const PIP_INSIDE: u64 = 0;
+const PIP_OUTSIDE: u64 = 1;
+const PIP_ON: u64 = 2;
+fn point_in_op_polygon<a>(c: (&a Clip), pt: Pt, op_in: u64) -> u64 {
+    mut op = op_in;
+    if (op == c.onext[op]) || (c.oprev[op] == c.onext[op]) {
+        return PIP_OUTSIDE;
+    }
+    mut op2 = op;
+    loop {
+        if c.oy[op] != pt.y {
+            break;
+        }
+        op = c.onext[op];
+        if op == op2 {
+            break;
+        }
+    }
+    if c.oy[op] == pt.y {
+        return PIP_OUTSIDE;
+    }
+    mut is_above = c.oy[op] < pt.y;
+    starting_above := is_above;
+    mut val: i64 = 0;
+    op2 = c.onext[op];
+    while op2 != op {
+        if is_above {
+            while (op2 != op) && (c.oy[op2] < pt.y) {
+                op2 = c.onext[op2];
+            }
+        } else {
+            while (op2 != op) && (c.oy[op2] > pt.y) {
+                op2 = c.onext[op2];
+            }
+        }
+        if op2 == op {
+            break;
+        }
+        pv := c.oprev[op2];
+        if c.oy[op2] == pt.y {
+            if (c.ox[op2] == pt.x) || ((c.oy[op2] == c.oy[pv]) && ((pt.x < c.ox[pv]) != (pt.x < c.ox[op2]))) {
+                return PIP_ON;
+            }
+            op2 = c.onext[op2];
+            if op2 == op {
+                break;
+            }
+            continue;
+        }
+        if (pt.x < c.ox[op2]) && (pt.x < c.ox[pv]) {
+        } else {
+            if (pt.x > c.ox[pv]) && (pt.x > c.ox[op2]) {
+                val = 1 - val;
+            } else {
+                i := cross_sign(opt(&c, pv), opt(&c, op2), Pt { x: pt.x, y: pt.y });
+                if i == 0 {
+                    return PIP_ON;
+                }
+                if (i < 0) == is_above {
+                    val = 1 - val;
+                }
+            }
+        }
+        is_above = is_above == false;
+        op2 = c.onext[op2];
+    }
+    if is_above != starting_above {
+        i := cross_sign(opt(&c, c.oprev[op2]), opt(&c, op2), Pt { x: pt.x, y: pt.y });
+        if i == 0 {
+            return PIP_ON;
+        }
+        if (i < 0) == is_above {
+            val = 1 - val;
+        }
+    }
+    if val == 0 {
+        return PIP_OUTSIDE;
+    }
+    return PIP_INSIDE;
+}
+
+fn path_point_in_polygon<a>(pt: Pt, poly: (&a XY)) -> u64 {
+    n := poly.x.len();
+    if n < 3 {
+        return PIP_OUTSIDE;
+    }
+    mut val: i64 = 0;
+    mut cbegin: u64 = 0;
+    mut first: u64 = 0;
+    mut cend = n;
+    while (first != cend) && (poly.y[first] == pt.y) {
+        first += 1;
+    }
+    if first == cend {
+        return PIP_OUTSIDE;
+    }
+    mut is_above = poly.y[first] < pt.y;
+    starting_above := is_above;
+    mut curr = first + 1;
+    loop {
+        if curr == cend {
+            if (cend == first) || (first == cbegin) {
+                break;
+            }
+            cend = first;
+            curr = cbegin;
+        }
+        if is_above {
+            while (curr != cend) && (poly.y[curr] < pt.y) {
+                curr += 1;
+            }
+            if curr == cend {
+                continue;
+            }
+        } else {
+            while (curr != cend) && (poly.y[curr] > pt.y) {
+                curr += 1;
+            }
+            if curr == cend {
+                continue;
+            }
+        }
+        mut prev: u64 = 0;
+        if curr == cbegin {
+            prev = n - 1;
+        } else {
+            prev = curr - 1;
+        }
+        if poly.y[curr] == pt.y {
+            if (poly.x[curr] == pt.x) || ((poly.y[curr] == poly.y[prev]) && ((pt.x < poly.x[prev]) != (pt.x < poly.x[curr]))) {
+                return PIP_ON;
+            }
+            curr += 1;
+            if curr == first {
+                break;
+            }
+            continue;
+        }
+        if (pt.x < poly.x[curr]) && (pt.x < poly.x[prev]) {
+        } else {
+            if (pt.x > poly.x[prev]) && (pt.x > poly.x[curr]) {
+                val = 1 - val;
+            } else {
+                d := cross_sign(Pt { x: poly.x[prev], y: poly.y[prev] }, Pt { x: poly.x[curr], y: poly.y[curr] }, Pt { x: pt.x, y: pt.y });
+                if d == 0 {
+                    return PIP_ON;
+                }
+                if (d < 0) == is_above {
+                    val = 1 - val;
+                }
+            }
+        }
+        is_above = is_above == false;
+        curr += 1;
+    }
+    if is_above != starting_above {
+        cend = n;
+        if curr == cend {
+            curr = cbegin;
+        }
+        mut prev: u64 = 0;
+        if curr == cbegin {
+            prev = cend - 1;
+        } else {
+            prev = curr - 1;
+        }
+        d := cross_sign(Pt { x: poly.x[prev], y: poly.y[prev] }, Pt { x: poly.x[curr], y: poly.y[curr] }, Pt { x: pt.x, y: pt.y });
+        if d == 0 {
+            return PIP_ON;
+        }
+        if (d < 0) == is_above {
+            val = 1 - val;
+        }
+    }
+    if val == 0 {
+        return PIP_OUTSIDE;
+    }
+    return PIP_INSIDE;
+}
+
+// Clean path of an output ring as coordinate lists (drops collinear axis-aligned points).
+struct XY {
+    x: i64[],
+    y: i64[]
+}
+fn clean_path<a>(c: (&a Clip), op: u64) -> XY {
+    mut r = XY { x: i64[], y: i64[] };
+    mut op2 = op;
+    while (c.onext[op2] != op)
+        && (((c.ox[op2] == c.ox[c.onext[op2]]) && (c.ox[op2] == c.ox[c.oprev[op2]]))
+            || ((c.oy[op2] == c.oy[c.onext[op2]]) && (c.oy[op2] == c.oy[c.oprev[op2]]))) {
+        op2 = c.onext[op2];
+    }
+    r.x.push(c.ox[op2]);
+    r.y.push(c.oy[op2]);
+    mut prev = op2;
+    op2 = c.onext[op2];
+    while op2 != op {
+        nx := c.onext[op2];
+        if ((c.ox[op2] != c.ox[nx]) || (c.ox[op2] != c.ox[prev])) && ((c.oy[op2] != c.oy[nx]) || (c.oy[op2] != c.oy[prev])) {
+            r.x.push(c.ox[op2]);
+            r.y.push(c.oy[op2]);
+            prev = op2;
+        }
+        op2 = c.onext[op2];
+    }
+    return r;
+}
+fn path2_contains_path1_xy<a, b>(p1: (&a XY), p2: (&b XY)) -> bool {
+    mut pip = PIP_ON;
+    for i in p1.x.len() {
+        r := path_point_in_polygon(Pt { x: p1.x[i], y: p1.y[i] }, &p2);
+        if r == PIP_OUTSIDE {
+            if pip == PIP_OUTSIDE {
+                return false;
+            }
+            pip = PIP_OUTSIDE;
+        }
+        if r == PIP_INSIDE {
+            if pip == PIP_INSIDE {
+                return true;
+            }
+            pip = PIP_INSIDE;
+        }
+    }
+    if pip != PIP_INSIDE {
+        return false;
+    }
+    // bounds midpoint of path1
+    mut l = p1.x[0];
+    mut r = p1.x[0];
+    mut t = p1.y[0];
+    mut b = p1.y[0];
+    for i in p1.x.len() {
+        if p1.x[i] < l {
+            l = p1.x[i];
+        }
+        if p1.x[i] > r {
+            r = p1.x[i];
+        }
+        if p1.y[i] < t {
+            t = p1.y[i];
+        }
+        if p1.y[i] > b {
+            b = p1.y[i];
+        }
+    }
+    mid := Pt { x: (l + r) / 2, y: (t + b) / 2 };
+    return path_point_in_polygon(mid, &p2) == PIP_INSIDE;
+}
+fn path2_contains_path1<a>(c: (&a Clip), op1: u64, op2: u64) -> bool {
+    mut pip = PIP_ON;
+    mut op = op1;
+    loop {
+        r := point_in_op_polygon(&c, opt(&c, op), op2);
+        if r == PIP_OUTSIDE {
+            if pip == PIP_OUTSIDE {
+                return false;
+            }
+            pip = PIP_OUTSIDE;
+        }
+        if r == PIP_INSIDE {
+            if pip == PIP_INSIDE {
+                return true;
+            }
+            pip = PIP_INSIDE;
+        }
+        op = c.onext[op];
+        if op == op1 {
+            break;
+        }
+    }
+    a := clean_path(&c, op1);
+    b := clean_path(&c, op2);
+    return path2_contains_path1_xy(&a, &b);
+}
+
+fn add_loc_min<a>(c: (&a mut Clip), v: u64, polytype: u64, open: bool) {
+    if (c.vflags[v] & VF_LOCAL_MIN) != 0 {
+        return ();
+    }
+    f := c.vflags[v] | VF_LOCAL_MIN;
+    c.vflags[v] = f;
+    c.lm_v.push(v);
+    c.lm_type.push(polytype);
+    c.lm_open.push(open);
+}
+
+// Adds paths (flat x/y coordinate lists, one per path) as subject or clip.
+fn add_paths_<a, b>(c: (&a mut Clip), paths: (&b XY[]), polytype: u64, open: bool) {
+    if open {
+        c.has_open_paths = true;
+    }
+    c.lm_sorted = false;
+    for pi in paths.len() {
+        p := &paths[pi];
+        if p.x.len() == 0 {
+            continue;
+        }
+        v0 := c.vx.len();
+        mut prev_v = NIL;
+        mut cnt: u64 = 0;
+        for k in p.x.len() {
+            if prev_v != NIL {
+                if (c.vx[prev_v] == p.x[k]) && (c.vy[prev_v] == p.y[k]) {
+                    continue;
+                }
+            }
+            cur := c.vx.len();
+            c.vx.push(p.x[k]);
+            c.vy.push(p.y[k]);
+            c.vnext.push(NIL);
+            c.vprev.push(prev_v);
+            c.vflags.push(0);
+            if prev_v != NIL {
+                c.vnext[prev_v] = cur;
+            }
+            prev_v = cur;
+            cnt += 1;
+        }
+        if (prev_v == NIL) || (c.vprev[prev_v] == NIL) {
+            continue;
+        }
+        if (open == false) && (c.vx[prev_v] == c.vx[v0]) && (c.vy[prev_v] == c.vy[v0]) {
+            prev_v = c.vprev[prev_v];
+        }
+        c.vnext[prev_v] = v0;
+        c.vprev[v0] = prev_v;
+        if (cnt < 2) || ((cnt == 2) && (open == false)) {
+            continue;
+        }
+        mut going_up = false;
+        if open {
+            mut cur = c.vnext[v0];
+            while (cur != v0) && (c.vy[cur] == c.vy[v0]) {
+                cur = c.vnext[cur];
+            }
+            going_up = c.vy[cur] <= c.vy[v0];
+            if going_up {
+                c.vflags[v0] = VF_OPEN_START;
+                add_loc_min(&mut c, v0, polytype, true);
+            } else {
+                c.vflags[v0] = VF_OPEN_START | VF_LOCAL_MAX;
+            }
+        } else {
+            prev_v = c.vprev[v0];
+            while (prev_v != v0) && (c.vy[prev_v] == c.vy[v0]) {
+                prev_v = c.vprev[prev_v];
+            }
+            if prev_v == v0 {
+                continue;
+            }
+            going_up = c.vy[prev_v] > c.vy[v0];
+        }
+        going_up0 := going_up;
+        prev_v = v0;
+        mut cur = c.vnext[v0];
+        while cur != v0 {
+            if (c.vy[cur] > c.vy[prev_v]) && going_up {
+                f := c.vflags[prev_v] | VF_LOCAL_MAX;
+                c.vflags[prev_v] = f;
+                going_up = false;
+            } else {
+                if (c.vy[cur] < c.vy[prev_v]) && (going_up == false) {
+                    going_up = true;
+                    add_loc_min(&mut c, prev_v, polytype, open);
+                }
+            }
+            prev_v = cur;
+            cur = c.vnext[cur];
+        }
+        if open {
+            f := c.vflags[prev_v] | VF_OPEN_END;
+            c.vflags[prev_v] = f;
+            if going_up {
+                g := c.vflags[prev_v] | VF_LOCAL_MAX;
+                c.vflags[prev_v] = g;
+            } else {
+                add_loc_min(&mut c, prev_v, polytype, open);
+            }
+        } else {
+            if going_up != going_up0 {
+                if going_up0 {
+                    add_loc_min(&mut c, prev_v, polytype, false);
+                } else {
+                    g := c.vflags[prev_v] | VF_LOCAL_MAX;
+                    c.vflags[prev_v] = g;
+                }
+            }
+        }
+    }
+}
+
+// Scanlines: a max-heap of y values (std::priority_queue<int64_t>).
+fn insert_scanline<a>(c: (&a mut Clip), y: i64) {
+    c.scan.push(y);
+    mut i = c.scan.len() - 1;
+    while i > 0 {
+        parent := (i - 1) / 2;
+        if c.scan[parent] >= c.scan[i] {
+            break;
+        }
+        t := c.scan[parent];
+        c.scan[parent] = c.scan[i];
+        c.scan[i] = t;
+        i = parent;
+    }
+}
+fn heap_pop<a>(c: (&a mut Clip)) -> i64 {
+    top := c.scan[0];
+    last := c.scan.pop();
+    if c.scan.len() > 0 {
+        c.scan[0] = last;
+        n := c.scan.len();
+        mut i: u64 = 0;
+        loop {
+            l := 2 * i + 1;
+            r := l + 1;
+            mut m = i;
+            if (l < n) && (c.scan[l] > c.scan[m]) {
+                m = l;
+            }
+            if (r < n) && (c.scan[r] > c.scan[m]) {
+                m = r;
+            }
+            if m == i {
+                break;
+            }
+            t := c.scan[m];
+            c.scan[m] = c.scan[i];
+            c.scan[i] = t;
+            i = m;
+        }
+    }
+    return top;
+}
+// The next scanline y with duplicates removed (ok false when the queue is empty).
+struct Scan {
+    ok: bool,
+    y: i64
+}
+fn pop_scanline<a>(c: (&a mut Clip)) -> Scan {
+    if c.scan.len() == 0 {
+        return Scan { ok: false, y: 0 };
+    }
+    v := heap_pop(&mut c);
+    while (c.scan.len() > 0) && (c.scan[0] == v) {
+        heap_pop(&mut c);
+    }
+    return Scan { ok: true, y: v };
+}
+fn pop_local_minima<a>(c: (&a mut Clip), y: i64) -> u64 {
+    if c.lm_cur == c.lm_order.len() {
+        return NIL;
+    }
+    lm := c.lm_order[c.lm_cur];
+    if c.vy[c.lm_v[lm]] != y {
+        return NIL;
+    }
+    c.lm_cur += 1;
+    return lm;
+}
+
+// LocMinSorter: descending y, then ascending x; stable (std::stable_sort).
+fn lm_before<a>(c: (&a Clip), a: u64, b: u64) -> bool {
+    va := c.lm_v[a];
+    vb := c.lm_v[b];
+    if c.vy[vb] != c.vy[va] {
+        return c.vy[vb] < c.vy[va];
+    }
+    return c.vx[vb] > c.vx[va];
+}
+fn reset<a>(c: (&a mut Clip)) {
+    if c.lm_sorted == false {
+        mut order = u64[];
+        for i in c.lm_v.len() {
+            order.push(i);
+        }
+        // stable insertion sort (lists are small) would be quadratic on large inputs: use a
+        // stable merge sort
+        sort_lm(&c, &mut order);
+        c.lm_order = order;
+        c.lm_sorted = true;
+    }
+    mut i = c.lm_order.len();
+    while i > 0 {
+        i -= 1;
+        y := c.vy[c.lm_v[c.lm_order[i]]];
+        insert_scanline(&mut c, y);
+    }
+    c.lm_cur = 0;
+    c.actives = NIL;
+    c.sel = NIL;
+    c.succeeded = true;
+}
+fn sort_lm<a, b>(c: (&a Clip), order: (&b mut u64[])) {
+    n := order.len();
+    mut width: u64 = 1;
+    mut buf = u64[];
+    for i in n {
+        buf.push(order[i]);
+    }
+    while width < n {
+        mut lo: u64 = 0;
+        while lo < n {
+            mid := min_u(lo + width, n);
+            hi := min_u(lo + 2 * width, n);
+            mut i = lo;
+            mut j = mid;
+            mut k = lo;
+            while (i < mid) && (j < hi) {
+                // take from the right only when it strictly precedes (stability)
+                if lm_before(&c, order[j], order[i]) {
+                    buf[k] = order[j];
+                    j += 1;
+                } else {
+                    buf[k] = order[i];
+                    i += 1;
+                }
+                k += 1;
+            }
+            while i < mid {
+                buf[k] = order[i];
+                i += 1;
+                k += 1;
+            }
+            while j < hi {
+                buf[k] = order[j];
+                j += 1;
+                k += 1;
+            }
+            lo = hi;
+        }
+        for t in n {
+            order[t] = buf[t];
+        }
+        width *= 2;
+    }
+}
+fn min_u(a: u64, b: u64) -> u64 {
+    if a < b {
+        return a;
+    }
+    return b;
+}
+
+fn is_contributing_closed<a>(c: (&a Clip), e: u64) -> bool {
+    wc := c.ewc[e];
+    wc2 := c.ewc2[e];
+    fr := c.fillrule;
+    if (fr == FILL_NON_ZERO) && (abs_i(wc) != 1) {
+        return false;
+    }
+    if (fr == FILL_POSITIVE) && (wc != 1) {
+        return false;
+    }
+    if (fr == FILL_NEGATIVE) && (wc != -1) {
+        return false;
+    }
+    ct := c.cliptype;
+    if ct == CLIP_INTERSECTION {
+        if fr == FILL_POSITIVE {
+            return wc2 > 0;
+        }
+        if fr == FILL_NEGATIVE {
+            return wc2 < 0;
+        }
+        return wc2 != 0;
+    }
+    if ct == CLIP_UNION {
+        if fr == FILL_POSITIVE {
+            return wc2 <= 0;
+        }
+        if fr == FILL_NEGATIVE {
+            return wc2 >= 0;
+        }
+        return wc2 == 0;
+    }
+    if ct == CLIP_DIFFERENCE {
+        mut result = wc2 == 0;
+        if fr == FILL_POSITIVE {
+            result = wc2 <= 0;
+        }
+        if fr == FILL_NEGATIVE {
+            result = wc2 >= 0;
+        }
+        if poly_type(&c, e) == SUBJECT {
+            return result;
+        }
+        return result == false;
+    }
+    if ct == CLIP_XOR {
+        return true;
+    }
+    return false;
+}
+fn is_contributing_open<a>(c: (&a Clip), e: u64) -> bool {
+    mut in_clip = c.ewc2[e] != 0;
+    mut in_subj = c.ewc[e] != 0;
+    if c.fillrule == FILL_POSITIVE {
+        in_clip = c.ewc2[e] > 0;
+        in_subj = c.ewc[e] > 0;
+    }
+    if c.fillrule == FILL_NEGATIVE {
+        in_clip = c.ewc2[e] < 0;
+        in_subj = c.ewc[e] < 0;
+    }
+    if c.cliptype == CLIP_INTERSECTION {
+        return in_clip;
+    }
+    if c.cliptype == CLIP_UNION {
+        return (in_subj == false) && (in_clip == false);
+    }
+    return in_clip == false;
+}
+
+fn set_wind_count_closed<a>(c: (&a mut Clip), e: u64) {
+    mut e2 = c.eprev[e];
+    pt := poly_type(&c, e);
+    while (e2 != NIL) && ((poly_type(&c, e2) != pt) || is_open(&c, e2)) {
+        e2 = c.eprev[e2];
+    }
+    if e2 == NIL {
+        w := c.ewdx[e];
+        c.ewc[e] = w;
+        e2 = c.actives;
+    } else {
+        if c.fillrule == FILL_EVEN_ODD {
+            w := c.ewdx[e];
+            c.ewc[e] = w;
+            w2 := c.ewc2[e2];
+            c.ewc2[e] = w2;
+            e2 = c.enext[e2];
+        } else {
+            if c.ewc[e2] * c.ewdx[e2] < 0 {
+                if abs_i(c.ewc[e2]) > 1 {
+                    if c.ewdx[e2] * c.ewdx[e] < 0 {
+                        w := c.ewc[e2];
+                        c.ewc[e] = w;
+                    } else {
+                        w := c.ewc[e2] + c.ewdx[e];
+                        c.ewc[e] = w;
+                    }
+                } else {
+                    mut w = c.ewdx[e];
+                    if is_open(&c, e) {
+                        w = 1;
+                    }
+                    c.ewc[e] = w;
+                }
+            } else {
+                if c.ewdx[e2] * c.ewdx[e] < 0 {
+                    w := c.ewc[e2];
+                    c.ewc[e] = w;
+                } else {
+                    w := c.ewc[e2] + c.ewdx[e];
+                    c.ewc[e] = w;
+                }
+            }
+            w2 := c.ewc2[e2];
+            c.ewc2[e] = w2;
+            e2 = c.enext[e2];
+        }
+    }
+    if c.fillrule == FILL_EVEN_ODD {
+        while e2 != e {
+            if (poly_type(&c, e2) != pt) && (is_open(&c, e2) == false) {
+                mut w2: i64 = 0;
+                if c.ewc2[e] == 0 {
+                    w2 = 1;
+                }
+                c.ewc2[e] = w2;
+            }
+            e2 = c.enext[e2];
+        }
+    } else {
+        while e2 != e {
+            if (poly_type(&c, e2) != pt) && (is_open(&c, e2) == false) {
+                w2 := c.ewc2[e] + c.ewdx[e2];
+                c.ewc2[e] = w2;
+            }
+            e2 = c.enext[e2];
+        }
+    }
+}
+fn set_wind_count_open<a>(c: (&a mut Clip), e: u64) {
+    mut e2 = c.actives;
+    if c.fillrule == FILL_EVEN_ODD {
+        mut cnt1: i64 = 0;
+        mut cnt2: i64 = 0;
+        while e2 != e {
+            if poly_type(&c, e2) == CLIP {
+                cnt2 += 1;
+            } else {
+                if is_open(&c, e2) == false {
+                    cnt1 += 1;
+                }
+            }
+            e2 = c.enext[e2];
+        }
+        mut w: i64 = 0;
+        if is_odd(cnt1) {
+            w = 1;
+        }
+        mut w2: i64 = 0;
+        if is_odd(cnt2) {
+            w2 = 1;
+        }
+        c.ewc[e] = w;
+        c.ewc2[e] = w2;
+    } else {
+        while e2 != e {
+            if poly_type(&c, e2) == CLIP {
+                w2 := c.ewc2[e] + c.ewdx[e2];
+                c.ewc2[e] = w2;
+            } else {
+                if is_open(&c, e2) == false {
+                    w := c.ewc[e] + c.ewdx[e2];
+                    c.ewc[e] = w;
+                }
+            }
+            e2 = c.enext[e2];
+        }
+    }
+}
+
+fn etop<a>(c: (&a Clip), e: u64) -> Pt {
+    return Pt { x: c.etx[e], y: c.ety[e] };
+}
+fn ebot<a>(c: (&a Clip), e: u64) -> Pt {
+    return Pt { x: c.ebx[e], y: c.eby[e] };
+}
+fn is_valid_ael_order<a>(c: (&a Clip), resident: u64, newcomer: u64) -> bool {
+    if c.ecx[newcomer] != c.ecx[resident] {
+        return c.ecx[newcomer] > c.ecx[resident];
+    }
+    i := cross_sign(etop(&c, resident), ebot(&c, newcomer), etop(&c, newcomer));
+    if i != 0 {
+        return i < 0;
+    }
+    if (is_maxima(&c, resident) == false) && (c.ety[resident] > c.ety[newcomer]) {
+        return cross_sign(ebot(&c, newcomer), etop(&c, resident), vpt(&c, next_vertex(&c, resident))) <= 0;
+    }
+    if (is_maxima(&c, newcomer) == false) && (c.ety[newcomer] > c.ety[resident]) {
+        return cross_sign(ebot(&c, newcomer), etop(&c, newcomer), vpt(&c, next_vertex(&c, newcomer))) >= 0;
+    }
+    y := c.eby[newcomer];
+    newcomer_left := c.eleft[newcomer];
+    if (c.eby[resident] != y) || (c.vy[c.lm_v[c.elm[resident]]] != y) {
+        return c.eleft[newcomer];
+    }
+    if c.eleft[resident] != newcomer_left {
+        return newcomer_left;
+    }
+    if is_collinear(vpt(&c, prev_prev_vertex(&c, resident)), ebot(&c, resident), etop(&c, resident)) {
+        return true;
+    }
+    return (cross_sign(vpt(&c, prev_prev_vertex(&c, resident)), ebot(&c, newcomer), vpt(&c, prev_prev_vertex(&c, newcomer))) > 0)
+        == newcomer_left;
+}
+fn insert_left_edge<a>(c: (&a mut Clip), e: u64) {
+    if c.actives == NIL {
+        c.eprev[e] = NIL;
+        c.enext[e] = NIL;
+        c.actives = e;
+        return ();
+    }
+    if is_valid_ael_order(&c, c.actives, e) == false {
+        a := c.actives;
+        c.eprev[e] = NIL;
+        c.enext[e] = a;
+        c.eprev[a] = e;
+        c.actives = e;
+        return ();
+    }
+    mut e2 = c.actives;
+    while (c.enext[e2] != NIL) && is_valid_ael_order(&c, c.enext[e2], e) {
+        e2 = c.enext[e2];
+    }
+    if c.ejoin[e2] == JOIN_RIGHT {
+        e2 = c.enext[e2];
+    }
+    if e2 == NIL {
+        return ();
+    }
+    nx := c.enext[e2];
+    c.enext[e] = nx;
+    if nx != NIL {
+        c.eprev[nx] = e;
+    }
+    c.eprev[e] = e2;
+    c.enext[e2] = e;
+}
+fn insert_right_edge<a>(c: (&a mut Clip), e: u64, e2: u64) {
+    nx := c.enext[e];
+    c.enext[e2] = nx;
+    if nx != NIL {
+        c.eprev[nx] = e2;
+    }
+    c.eprev[e2] = e;
+    c.enext[e] = e2;
+}
+fn new_active<a>(c: (&a mut Clip), lm: u64, wind_dx: i64, vtop: u64) -> u64 {
+    v := c.lm_v[lm];
+    n := c.ebx.len();
+    c.ebx.push(c.vx[v]);
+    c.eby.push(c.vy[v]);
+    c.etx.push(c.vx[vtop]);
+    c.ety.push(c.vy[vtop]);
+    c.ecx.push(c.vx[v]);
+    c.edx.push(0.0);
+    c.ewdx.push(wind_dx);
+    c.ewc.push(0);
+    c.ewc2.push(0);
+    c.erec.push(NIL);
+    c.eprev.push(NIL);
+    c.enext.push(NIL);
+    c.epsel.push(NIL);
+    c.ensel.push(NIL);
+    c.ejump.push(NIL);
+    c.evtop.push(vtop);
+    c.elm.push(lm);
+    c.eleft.push(false);
+    c.ejoin.push(JOIN_NONE);
+    set_dx(&mut c, n);
+    return n;
+}
+fn push_horz<a>(c: (&a mut Clip), e: u64) {
+    s := c.sel;
+    c.ensel[e] = s;
+    c.sel = e;
+}
+fn pop_horz<a>(c: (&a mut Clip)) -> u64 {
+    e := c.sel;
+    if e == NIL {
+        return NIL;
+    }
+    c.sel = c.ensel[e];
+    return e;
+}
+
+// Appends to an outrec's split list (nested vectors are updated by taking them out).
+fn push_split<a>(c: (&a mut Clip), rec: u64, v: u64) {
+    mut list = exchange(&mut c.r_splits[rec], u64[]);
+    list.push(v);
+    exchange(&mut c.r_splits[rec], list);
+}
+fn new_outrec<a>(c: (&a mut Clip)) -> u64 {
+    n := c.r_owner.len();
+    c.r_owner.push(NIL);
+    c.r_front.push(NIL);
+    c.r_back.push(NIL);
+    c.r_pts.push(NIL);
+    c.r_splits.push(u64[]);
+    c.r_rsplit.push(NIL);
+    c.r_left.push(0);
+    c.r_top.push(0);
+    c.r_right.push(0);
+    c.r_bottom.push(0);
+    c.r_px.push(i64[]);
+    c.r_py.push(i64[]);
+    c.r_open.push(false);
+    c.r_polypath.push(NIL);
+    return n;
+}
+fn add_local_min_poly<a>(c: (&a mut Clip), e1: u64, e2: u64, pt: Pt, is_new: bool) -> u64 {
+    rec := new_outrec(&mut c);
+    c.erec[e1] = rec;
+    c.erec[e2] = rec;
+    if is_open(&c, e1) {
+        c.r_owner[rec] = NIL;
+        c.r_open[rec] = true;
+        if c.ewdx[e1] > 0 {
+            set_sides(&mut c, rec, e1, e2);
+        } else {
+            set_sides(&mut c, rec, e2, e1);
+        }
+    } else {
+        prev_hot := prev_hot_edge(&c, e1);
+        if prev_hot != NIL {
+            if c.using_polytree {
+                ph := c.erec[prev_hot];
+                set_owner(&mut c, rec, ph);
+            }
+            if outrec_is_ascending(&c, prev_hot) == is_new {
+                set_sides(&mut c, rec, e2, e1);
+            } else {
+                set_sides(&mut c, rec, e1, e2);
+            }
+        } else {
+            c.r_owner[rec] = NIL;
+            if is_new {
+                set_sides(&mut c, rec, e1, e2);
+            } else {
+                set_sides(&mut c, rec, e2, e1);
+            }
+        }
+    }
+    op := new_outpt(&mut c, pt.x, pt.y, rec);
+    c.r_pts[rec] = op;
+    return op;
+}
+fn add_local_max_poly<a>(c: (&a mut Clip), e1: u64, e2: u64, pt: Pt) -> u64 {
+    if is_joined(&c, e1) {
+        split(&mut c, e1, Pt { x: pt.x, y: pt.y });
+    }
+    if is_joined(&c, e2) {
+        split(&mut c, e2, Pt { x: pt.x, y: pt.y });
+    }
+    if is_front(&c, e1) == is_front(&c, e2) {
+        if is_open_end(&c, e1) {
+            r1 := c.erec[e1];
+            swap_sides(&mut c, r1);
+        } else {
+            if is_open_end(&c, e2) {
+                r2 := c.erec[e2];
+                swap_sides(&mut c, r2);
+            } else {
+                c.succeeded = false;
+                return NIL;
+            }
+        }
+    }
+    mut result = add_out_pt(&mut c, e1, Pt { x: pt.x, y: pt.y });
+    if c.erec[e1] == c.erec[e2] {
+        rec := c.erec[e1];
+        c.r_pts[rec] = result;
+        if c.using_polytree {
+            e := prev_hot_edge(&c, e1);
+            if e == NIL {
+                c.r_owner[rec] = NIL;
+            } else {
+                er := c.erec[e];
+                set_owner(&mut c, rec, er);
+            }
+        }
+        uncouple_outrec(&mut c, e1);
+        result = c.r_pts[rec];
+        o := c.r_owner[rec];
+        if (o != NIL) && (c.r_front[o] == NIL) {
+            ro := real_outrec(&c, o);
+            c.r_owner[rec] = ro;
+        }
+    } else {
+        if is_open(&c, e1) {
+            if c.ewdx[e1] < 0 {
+                join_outrec_paths(&mut c, e1, e2);
+            } else {
+                join_outrec_paths(&mut c, e2, e1);
+            }
+        } else {
+            if c.erec[e1] < c.erec[e2] {
+                join_outrec_paths(&mut c, e1, e2);
+            } else {
+                join_outrec_paths(&mut c, e2, e1);
+            }
+        }
+    }
+    return result;
+}
+fn join_outrec_paths<a>(c: (&a mut Clip), e1: u64, e2: u64) {
+    r1 := c.erec[e1];
+    r2 := c.erec[e2];
+    p1_st := c.r_pts[r1];
+    p2_st := c.r_pts[r2];
+    p1_end := c.onext[p1_st];
+    p2_end := c.onext[p2_st];
+    if is_front(&c, e1) {
+        c.oprev[p2_end] = p1_st;
+        c.onext[p1_st] = p2_end;
+        c.onext[p2_st] = p1_end;
+        c.oprev[p1_end] = p2_st;
+        c.r_pts[r1] = p2_st;
+        f := c.r_front[r2];
+        c.r_front[r1] = f;
+        if f != NIL {
+            c.erec[f] = r1;
+        }
+    } else {
+        c.oprev[p1_end] = p2_st;
+        c.onext[p2_st] = p1_end;
+        c.onext[p1_st] = p2_end;
+        c.oprev[p2_end] = p1_st;
+        b := c.r_back[r2];
+        c.r_back[r1] = b;
+        if b != NIL {
+            c.erec[b] = r1;
+        }
+    }
+    c.r_front[r2] = NIL;
+    c.r_back[r2] = NIL;
+    c.r_pts[r2] = NIL;
+    if is_open_end(&c, e1) {
+        p := c.r_pts[r1];
+        c.r_pts[r2] = p;
+        c.r_pts[r1] = NIL;
+    } else {
+        set_owner(&mut c, r2, r1);
+    }
+    c.erec[e1] = NIL;
+    c.erec[e2] = NIL;
+}
+fn add_out_pt<a>(c: (&a mut Clip), e: u64, pt: Pt) -> u64 {
+    rec := c.erec[e];
+    to_front := is_front(&c, e);
+    op_front := c.r_pts[rec];
+    op_back := c.onext[op_front];
+    if to_front {
+        if (pt.x == c.ox[op_front]) && (pt.y == c.oy[op_front]) {
+            return op_front;
+        }
+    } else {
+        if (pt.x == c.ox[op_back]) && (pt.y == c.oy[op_back]) {
+            return op_back;
+        }
+    }
+    n := new_outpt(&mut c, pt.x, pt.y, rec);
+    c.oprev[op_back] = n;
+    c.oprev[n] = op_front;
+    c.onext[n] = op_back;
+    c.onext[op_front] = n;
+    if to_front {
+        c.r_pts[rec] = n;
+    }
+    return n;
+}
+fn clean_collinear<a>(c: (&a mut Clip), rec_in: u64) {
+    rec := real_outrec(&c, rec_in);
+    if (rec == NIL) || c.r_open[rec] {
+        return ();
+    }
+    if is_valid_closed_path(&c, c.r_pts[rec]) == false {
+        dispose_outpts(&mut c, rec);
+        return ();
+    }
+    mut start = c.r_pts[rec];
+    mut op2 = start;
+    loop {
+        pv := c.oprev[op2];
+        nx := c.onext[op2];
+        if is_collinear(opt(&c, pv), opt(&c, op2), opt(&c, nx))
+            && (((c.ox[op2] == c.ox[pv]) && (c.oy[op2] == c.oy[pv]))
+                || ((c.ox[op2] == c.ox[nx]) && (c.oy[op2] == c.oy[nx])) || (c.preserve_collinear == false)
+                || (dot_product(opt(&c, pv), opt(&c, op2), opt(&c, nx)) < 0.0)) {
+            if op2 == c.r_pts[rec] {
+                c.r_pts[rec] = pv;
+            }
+            op2 = dispose_outpt(&mut c, op2);
+            if is_valid_closed_path(&c, op2) == false {
+                dispose_outpts(&mut c, rec);
+                return ();
+            }
+            start = op2;
+            continue;
+        }
+        op2 = c.onext[op2];
+        if op2 == start {
+            break;
+        }
+    }
+    fix_self_intersects(&mut c, rec);
+}
+
+// GetLineIntersectPt (CLIPPER2_HI_PRECISION off): the intersection of two segments' lines,
+// clamped to the first segment's ends. ok is false for parallel lines.
+struct Hit {
+    ok: bool,
+    x: i64,
+    y: i64
+}
+fn line_intersect(a1: Pt, a2: Pt, b1: Pt, b2: Pt) -> Hit {
+    dx1 := f64(a2.x - a1.x);
+    dy1 := f64(a2.y - a1.y);
+    dx2 := f64(b2.x - b1.x);
+    dy2 := f64(b2.y - b1.y);
+    det := dy1 * dx2 - dy2 * dx1;
+    if det == 0.0 {
+        return Hit { ok: false, x: 0, y: 0 };
+    }
+    t := (f64(a1.x - b1.x) * dy2 - f64(a1.y - b1.y) * dx2) / det;
+    if t <= 0.0 {
+        return Hit { ok: true, x: a1.x, y: a1.y };
+    }
+    if t >= 1.0 {
+        return Hit { ok: true, x: a2.x, y: a2.y };
+    }
+    // static_cast<int64_t> from double: truncation toward zero
+    return Hit { ok: true, x: i64(f64(a1.x) + t * dx1), y: i64(f64(a1.y) + t * dy1) };
+}
+fn do_split_op<a>(c: (&a mut Clip), rec: u64, split_op: u64) {
+    prev_op := c.oprev[split_op];
+    sn := c.onext[split_op];
+    next_next := c.onext[sn];
+    c.r_pts[rec] = prev_op;
+    h := line_intersect(opt(&c, prev_op), opt(&c, split_op), opt(&c, sn), opt(&c, next_next));
+    ip := Pt { x: h.x, y: h.y };
+    area1 := area_op(&c, c.r_pts[rec]);
+    abs1 := area1.abs();
+    if abs1 < 2.0 {
+        dispose_outpts(&mut c, rec);
+        return ();
+    }
+    area2 := area_triangle(Pt { x: ip.x, y: ip.y }, opt(&c, split_op), opt(&c, sn));
+    abs2 := area2.abs();
+    if ((ip.x == c.ox[prev_op]) && (ip.y == c.oy[prev_op])) || ((ip.x == c.ox[next_next]) && (ip.y == c.oy[next_next])) {
+        c.oprev[next_next] = prev_op;
+        c.onext[prev_op] = next_next;
+    } else {
+        pr := c.orec[prev_op];
+        n2 := new_outpt(&mut c, ip.x, ip.y, pr);
+        c.oprev[n2] = prev_op;
+        c.onext[n2] = next_next;
+        c.oprev[next_next] = n2;
+        c.onext[prev_op] = n2;
+    }
+    if (abs2 >= 1.0) && ((abs2 > abs1) || ((area2 > 0.0) == (area1 > 0.0))) {
+        nr := new_outrec(&mut c);
+        o := c.r_owner[rec];
+        c.r_owner[nr] = o;
+        c.orec[split_op] = nr;
+        c.orec[sn] = nr;
+        n := new_outpt(&mut c, ip.x, ip.y, nr);
+        c.oprev[n] = sn;
+        c.onext[n] = split_op;
+        c.r_pts[nr] = n;
+        c.oprev[split_op] = n;
+        c.onext[sn] = n;
+        if c.using_polytree {
+            if path2_contains_path1(&c, prev_op, n) {
+                push_split(&mut c, nr, rec);
+            } else {
+                push_split(&mut c, rec, nr);
+            }
+        }
+    }
+}
+// Clipper2 SegmentsIntersect (parametric; `inclusive` counts touching end points).
+fn segments_intersect(a1: Pt, a2: Pt, b1: Pt, b2: Pt, inclusive: bool) -> bool {
+    dy1 := f64(a2.y - a1.y);
+    dx1 := f64(a2.x - a1.x);
+    dy2 := f64(b2.y - b1.y);
+    dx2 := f64(b2.x - b1.x);
+    cp := dy1 * dx2 - dy2 * dx1;
+    if cp == 0.0 {
+        return false;
+    }
+    if inclusive {
+        mut t = f64(a1.x - b1.x) * dy2 - f64(a1.y - b1.y) * dx2;
+        if t == 0.0 {
+            return true;
+        }
+        if t > 0.0 {
+            if (cp < 0.0) || (t > cp) {
+                return false;
+            }
+        } else {
+            if (cp > 0.0) || (t < cp) {
+                return false;
+            }
+        }
+        t = f64(a1.x - b1.x) * dy1 - f64(a1.y - b1.y) * dx1;
+        if t == 0.0 {
+            return true;
+        }
+        if t > 0.0 {
+            return (cp > 0.0) && (t <= cp);
+        }
+        return (cp < 0.0) && (t >= cp);
+    }
+    mut t = f64(a1.x - b1.x) * dy2 - f64(a1.y - b1.y) * dx2;
+    if t == 0.0 {
+        return false;
+    }
+    if t > 0.0 {
+        if (cp < 0.0) || (t >= cp) {
+            return false;
+        }
+    } else {
+        if (cp > 0.0) || (t <= cp) {
+            return false;
+        }
+    }
+    t = f64(a1.x - b1.x) * dy1 - f64(a1.y - b1.y) * dx1;
+    if t == 0.0 {
+        return false;
+    }
+    if t > 0.0 {
+        return (cp > 0.0) && (t < cp);
+    }
+    return (cp < 0.0) && (t > cp);
+}
+fn sign_f(v: f64) -> i64 {
+    if v > 0.0 {
+        return 1;
+    }
+    if v < 0.0 {
+        return -1;
+    }
+    return 0;
+}
+fn fix_self_intersects<a>(c: (&a mut Clip), rec: u64) {
+    mut op2 = c.r_pts[rec];
+    if c.oprev[op2] == c.onext[c.onext[op2]] {
+        return ();
+    }
+    loop {
+        pv := c.oprev[op2];
+        n1 := c.onext[op2];
+        n2 := c.onext[n1];
+        if segments_intersect(opt(&c, pv), opt(&c, op2), opt(&c, n1), opt(&c, n2), false) {
+            n3 := c.onext[n2];
+            if segments_intersect(opt(&c, pv), opt(&c, op2), opt(&c, n2), opt(&c, n3), false) {
+                op2 = duplicate_op(&mut c, op2, false);
+                // op2.pt = op2.next.next.next.pt
+                t := c.onext[c.onext[c.onext[op2]]];
+                x := c.ox[t];
+                y := c.oy[t];
+                c.ox[op2] = x;
+                c.oy[op2] = y;
+                op2 = c.onext[op2];
+            } else {
+                if (op2 == c.r_pts[rec]) || (c.onext[op2] == c.r_pts[rec]) {
+                    p := c.oprev[c.r_pts[rec]];
+                    c.r_pts[rec] = p;
+                }
+                do_split_op(&mut c, rec, op2);
+                if c.r_pts[rec] == NIL {
+                    break;
+                }
+                op2 = c.r_pts[rec];
+                if c.oprev[op2] == c.onext[c.onext[op2]] {
+                    break;
+                }
+                continue;
+            }
+        } else {
+            op2 = c.onext[op2];
+        }
+        if op2 == c.r_pts[rec] {
+            break;
+        }
+    }
+}
+fn update_outrec_owner<a>(c: (&a mut Clip), rec: u64) {
+    mut cur = c.r_pts[rec];
+    loop {
+        c.orec[cur] = rec;
+        cur = c.onext[cur];
+        if cur == c.r_pts[rec] {
+            return ();
+        }
+    }
+}
+
+fn start_open_path<a>(c: (&a mut Clip), e: u64, pt: Pt) -> u64 {
+    rec := new_outrec(&mut c);
+    c.r_open[rec] = true;
+    if c.ewdx[e] > 0 {
+        c.r_front[rec] = e;
+        c.r_back[rec] = NIL;
+    } else {
+        c.r_front[rec] = NIL;
+        c.r_back[rec] = e;
+    }
+    c.erec[e] = rec;
+    op := new_outpt(&mut c, pt.x, pt.y, rec);
+    c.r_pts[rec] = op;
+    return op;
+}
+fn trim_horz<a>(c: (&a mut Clip), e: u64, preserve: bool) {
+    mut trimmed = false;
+    mut v = next_vertex(&c, e);
+    while c.vy[v] == c.ety[e] {
+        if preserve && ((c.vx[v] < c.etx[e]) != (c.ebx[e] < c.etx[e])) {
+            break;
+        }
+        c.evtop[e] = v;
+        x := c.vx[v];
+        y := c.vy[v];
+        c.etx[e] = x;
+        c.ety[e] = y;
+        trimmed = true;
+        if is_maxima(&c, e) {
+            break;
+        }
+        v = next_vertex(&c, e);
+    }
+    if trimmed {
+        set_dx(&mut c, e);
+    }
+}
+fn update_edge_into_ael<a>(c: (&a mut Clip), e: u64) {
+    tx := c.etx[e];
+    ty := c.ety[e];
+    c.ebx[e] = tx;
+    c.eby[e] = ty;
+    nv := next_vertex(&c, e);
+    c.evtop[e] = nv;
+    nx := c.vx[nv];
+    ny := c.vy[nv];
+    c.etx[e] = nx;
+    c.ety[e] = ny;
+    c.ecx[e] = tx;
+    set_dx(&mut c, e);
+    if is_joined(&c, e) {
+        split(&mut c, e, Pt { x: tx, y: ty });
+    }
+    if is_horizontal(&c, e) {
+        if is_open(&c, e) == false {
+            p := c.preserve_collinear;
+            trim_horz(&mut c, e, p);
+        }
+        return ();
+    }
+    insert_scanline(&mut c, ny);
+    check_join_left(&mut c, e, Pt { x: tx, y: ty }, false);
+    check_join_right(&mut c, e, Pt { x: tx, y: ty }, true);
+}
+fn edge_with_matching_locmin<a>(c: (&a Clip), e: u64) -> u64 {
+    mut r = c.enext[e];
+    while r != NIL {
+        if c.elm[r] == c.elm[e] {
+            return r;
+        }
+        if (is_horizontal(&c, r) == false) && ((c.ebx[e] != c.ebx[r]) || (c.eby[e] != c.eby[r])) {
+            r = NIL;
+        } else {
+            r = c.enext[r];
+        }
+    }
+    r = c.eprev[e];
+    while r != NIL {
+        if c.elm[r] == c.elm[e] {
+            return r;
+        }
+        if (is_horizontal(&c, r) == false) && ((c.ebx[e] != c.ebx[r]) || (c.eby[e] != c.eby[r])) {
+            return NIL;
+        }
+        r = c.eprev[r];
+    }
+    return r;
+}
+
+// Winding count as seen by the fill rule (abs for EvenOdd/NonZero, signed for Positive, negated
+// for Negative).
+fn fill_count<a>(c: (&a Clip), w: i64) -> i64 {
+    if (c.fillrule == FILL_EVEN_ODD) || (c.fillrule == FILL_NON_ZERO) {
+        return abs_i(w);
+    }
+    if c.fillrule == FILL_POSITIVE {
+        return w;
+    }
+    return 0 - w;
+}
+fn intersect_edges<a>(c: (&a mut Clip), e1: u64, e2: u64, pt: Pt) {
+    if c.has_open_paths && (is_open(&c, e1) || is_open(&c, e2)) {
+        if is_open(&c, e1) && is_open(&c, e2) {
+            return ();
+        }
+        mut eo = e2;
+        mut ec = e1;
+        if is_open(&c, e1) {
+            eo = e1;
+            ec = e2;
+        }
+        if is_joined(&c, ec) {
+            split(&mut c, ec, Pt { x: pt.x, y: pt.y });
+        }
+        if abs_i(c.ewc[ec]) != 1 {
+            return ();
+        }
+        if c.cliptype == CLIP_UNION {
+            if is_hot(&c, ec) == false {
+                return ();
+            }
+        } else {
+            if c.lm_type[c.elm[ec]] == SUBJECT {
+                return ();
+            }
+        }
+        if (c.fillrule == FILL_POSITIVE) && (c.ewc[ec] != 1) {
+            return ();
+        }
+        if (c.fillrule == FILL_NEGATIVE) && (c.ewc[ec] != -1) {
+            return ();
+        }
+        if (c.fillrule != FILL_POSITIVE) && (c.fillrule != FILL_NEGATIVE) && (abs_i(c.ewc[ec]) != 1) {
+            return ();
+        }
+        if is_hot(&c, eo) {
+            add_out_pt(&mut c, eo, Pt { x: pt.x, y: pt.y });
+            r := c.erec[eo];
+            if is_front(&c, eo) {
+                c.r_front[r] = NIL;
+            } else {
+                c.r_back[r] = NIL;
+            }
+            c.erec[eo] = NIL;
+        } else {
+            lv := c.lm_v[c.elm[eo]];
+            if (pt.x == c.vx[lv]) && (pt.y == c.vy[lv]) && (is_open_end_v(&c, lv) == false) {
+                e3 := edge_with_matching_locmin(&c, eo);
+                if (e3 != NIL) && is_hot(&c, e3) {
+                    r3 := c.erec[e3];
+                    c.erec[eo] = r3;
+                    if c.ewdx[eo] > 0 {
+                        set_sides(&mut c, r3, eo, e3);
+                    } else {
+                        set_sides(&mut c, r3, e3, eo);
+                    }
+                    return ();
+                }
+                start_open_path(&mut c, eo, Pt { x: pt.x, y: pt.y });
+            } else {
+                start_open_path(&mut c, eo, Pt { x: pt.x, y: pt.y });
+            }
+        }
+        return ();
+    }
+    if is_joined(&c, e1) {
+        split(&mut c, e1, Pt { x: pt.x, y: pt.y });
+    }
+    if is_joined(&c, e2) {
+        split(&mut c, e2, Pt { x: pt.x, y: pt.y });
+    }
+    if c.lm_type[c.elm[e1]] == c.lm_type[c.elm[e2]] {
+        if c.fillrule == FILL_EVEN_ODD {
+            old := c.ewc[e1];
+            w2 := c.ewc[e2];
+            c.ewc[e1] = w2;
+            c.ewc[e2] = old;
+        } else {
+            if c.ewc[e1] + c.ewdx[e2] == 0 {
+                w := 0 - c.ewc[e1];
+                c.ewc[e1] = w;
+            } else {
+                w := c.ewc[e1] + c.ewdx[e2];
+                c.ewc[e1] = w;
+            }
+            if c.ewc[e2] - c.ewdx[e1] == 0 {
+                w := 0 - c.ewc[e2];
+                c.ewc[e2] = w;
+            } else {
+                w := c.ewc[e2] - c.ewdx[e1];
+                c.ewc[e2] = w;
+            }
+        }
+    } else {
+        if c.fillrule != FILL_EVEN_ODD {
+            a := c.ewc2[e1] + c.ewdx[e2];
+            b := c.ewc2[e2] - c.ewdx[e1];
+            c.ewc2[e1] = a;
+            c.ewc2[e2] = b;
+        } else {
+            mut a: i64 = 0;
+            if c.ewc2[e1] == 0 {
+                a = 1;
+            }
+            mut b: i64 = 0;
+            if c.ewc2[e2] == 0 {
+                b = 1;
+            }
+            c.ewc2[e1] = a;
+            c.ewc2[e2] = b;
+        }
+    }
+    old1 := fill_count(&c, c.ewc[e1]);
+    old2 := fill_count(&c, c.ewc[e2]);
+    in01_1 := (old1 == 0) || (old1 == 1);
+    in01_2 := (old2 == 0) || (old2 == 1);
+    if ((is_hot(&c, e1) == false) && (in01_1 == false)) || ((is_hot(&c, e2) == false) && (in01_2 == false)) {
+        return ();
+    }
+    if is_hot(&c, e1) && is_hot(&c, e2) {
+        if ((old1 != 0) && (old1 != 1)) || ((old2 != 0) && (old2 != 1))
+            || ((c.lm_type[c.elm[e1]] != c.lm_type[c.elm[e2]]) && (c.cliptype != CLIP_XOR)) {
+            add_local_max_poly(&mut c, e1, e2, Pt { x: pt.x, y: pt.y });
+        } else {
+            if is_front(&c, e1) || (c.erec[e1] == c.erec[e2]) {
+                add_local_max_poly(&mut c, e1, e2, Pt { x: pt.x, y: pt.y });
+                add_local_min_poly(&mut c, e1, e2, Pt { x: pt.x, y: pt.y }, false);
+            } else {
+                add_out_pt(&mut c, e1, Pt { x: pt.x, y: pt.y });
+                add_out_pt(&mut c, e2, Pt { x: pt.x, y: pt.y });
+                swap_outrecs(&mut c, e1, e2);
+            }
+        }
+        return ();
+    }
+    if is_hot(&c, e1) {
+        add_out_pt(&mut c, e1, Pt { x: pt.x, y: pt.y });
+        swap_outrecs(&mut c, e1, e2);
+        return ();
+    }
+    if is_hot(&c, e2) {
+        add_out_pt(&mut c, e2, Pt { x: pt.x, y: pt.y });
+        swap_outrecs(&mut c, e1, e2);
+        return ();
+    }
+    e1wc2 := fill_count(&c, c.ewc2[e1]);
+    e2wc2 := fill_count(&c, c.ewc2[e2]);
+    if same_poly_type(&c, e1, e2) == false {
+        add_local_min_poly(&mut c, e1, e2, Pt { x: pt.x, y: pt.y }, false);
+        return ();
+    }
+    if (old1 == 1) && (old2 == 1) {
+        ct := c.cliptype;
+        if ct == CLIP_UNION {
+            if (e1wc2 <= 0) && (e2wc2 <= 0) {
+                add_local_min_poly(&mut c, e1, e2, Pt { x: pt.x, y: pt.y }, false);
+            }
+            return ();
+        }
+        if ct == CLIP_DIFFERENCE {
+            if ((poly_type(&c, e1) == CLIP) && (e1wc2 > 0) && (e2wc2 > 0))
+                || ((poly_type(&c, e1) == SUBJECT) && (e1wc2 <= 0) && (e2wc2 <= 0)) {
+                add_local_min_poly(&mut c, e1, e2, Pt { x: pt.x, y: pt.y }, false);
+            }
+            return ();
+        }
+        if ct == CLIP_XOR {
+            add_local_min_poly(&mut c, e1, e2, Pt { x: pt.x, y: pt.y }, false);
+            return ();
+        }
+        if (e1wc2 > 0) && (e2wc2 > 0) {
+            add_local_min_poly(&mut c, e1, e2, Pt { x: pt.x, y: pt.y }, false);
+        }
+    }
+}
+fn delete_from_ael<a>(c: (&a mut Clip), e: u64) {
+    pv := c.eprev[e];
+    nx := c.enext[e];
+    if (pv == NIL) && (nx == NIL) && (e != c.actives) {
+        return ();
+    }
+    if pv != NIL {
+        c.enext[pv] = nx;
+    } else {
+        c.actives = nx;
+    }
+    if nx != NIL {
+        c.eprev[nx] = pv;
+    }
+    // "delete": unlink completely so a second delete is a no-op
+    c.eprev[e] = NIL;
+    c.enext[e] = NIL;
+}
+fn adjust_curr_x_and_copy_to_sel<a>(c: (&a mut Clip), top_y: i64) {
+    mut e = c.actives;
+    c.sel = e;
+    while e != NIL {
+        pv := c.eprev[e];
+        nx := c.enext[e];
+        c.epsel[e] = pv;
+        c.ensel[e] = nx;
+        c.ejump[e] = nx;
+        x := top_x(&c, e, top_y);
+        c.ecx[e] = x;
+        e = c.enext[e];
+    }
+}
+
+fn fix_outrec_pts<a>(c: (&a mut Clip), rec: u64) {
+    mut op = c.r_pts[rec];
+    loop {
+        c.orec[op] = rec;
+        op = c.onext[op];
+        if op == c.r_pts[rec] {
+            break;
+        }
+    }
+}
+fn set_horz_seg_heading_forward<a>(c: (&a mut Clip), hs: u64, op_p: u64, op_n: u64) -> bool {
+    if c.ox[op_p] == c.ox[op_n] {
+        return false;
+    }
+    if c.ox[op_p] < c.ox[op_n] {
+        c.hs_left[hs] = op_p;
+        c.hs_right[hs] = op_n;
+        c.hs_ltr[hs] = true;
+    } else {
+        c.hs_left[hs] = op_n;
+        c.hs_right[hs] = op_p;
+        c.hs_ltr[hs] = false;
+    }
+    return true;
+}
+fn update_horz_segment<a>(c: (&a mut Clip), hs: u64) -> bool {
+    op := c.hs_left[hs];
+    rec := real_outrec(&c, c.orec[op]);
+    has_edges := c.r_front[rec] != NIL;
+    curr_y := c.oy[op];
+    mut op_p = op;
+    mut op_n = op;
+    if has_edges {
+        op_a := c.r_pts[rec];
+        op_z := c.onext[op_a];
+        while (op_p != op_z) && (c.oy[c.oprev[op_p]] == curr_y) {
+            op_p = c.oprev[op_p];
+        }
+        while (op_n != op_a) && (c.oy[c.onext[op_n]] == curr_y) {
+            op_n = c.onext[op_n];
+        }
+    } else {
+        while (c.oprev[op_p] != op_n) && (c.oy[c.oprev[op_p]] == curr_y) {
+            op_p = c.oprev[op_p];
+        }
+        while (c.onext[op_n] != op_p) && (c.oy[c.onext[op_n]] == curr_y) {
+            op_n = c.onext[op_n];
+        }
+    }
+    result := set_horz_seg_heading_forward(&mut c, hs, op_p, op_n) && (c.ohorz[c.hs_left[hs]] == NIL);
+    if result {
+        l := c.hs_left[hs];
+        c.ohorz[l] = hs;
+    } else {
+        c.hs_right[hs] = NIL;
+    }
+    return result;
+}
+// HorzSegSorter: segments with a right_op first, then ascending left x; stable.
+fn hs_before<a>(c: (&a Clip), h1: u64, h2: u64) -> bool {
+    if (c.hs_right[h1] == NIL) || (c.hs_right[h2] == NIL) {
+        return c.hs_right[h1] != NIL;
+    }
+    return c.ox[c.hs_left[h2]] > c.ox[c.hs_left[h1]];
+}
+fn convert_horz_segs_to_joins<a>(c: (&a mut Clip)) {
+    mut j: u64 = 0;
+    for h in c.hs_left.len() {
+        if update_horz_segment(&mut c, h) {
+            j += 1;
+        }
+    }
+    if j < 2 {
+        return ();
+    }
+    // stable sort of segment indices (std::stable_sort), merge sort
+    n := c.hs_left.len();
+    mut order = u64[];
+    for i in n {
+        order.push(i);
+    }
+    mut buf = u64[];
+    for i in n {
+        buf.push(order[i]);
+    }
+    mut width: u64 = 1;
+    while width < n {
+        mut lo: u64 = 0;
+        while lo < n {
+            mid := min_u(lo + width, n);
+            hi := min_u(lo + 2 * width, n);
+            mut i = lo;
+            mut k = lo;
+            mut r = mid;
+            while (i < mid) && (r < hi) {
+                if hs_before(&c, order[r], order[i]) {
+                    buf[k] = order[r];
+                    r += 1;
+                } else {
+                    buf[k] = order[i];
+                    i += 1;
+                }
+                k += 1;
+            }
+            while i < mid {
+                buf[k] = order[i];
+                i += 1;
+                k += 1;
+            }
+            while r < hi {
+                buf[k] = order[r];
+                r += 1;
+                k += 1;
+            }
+            lo = hi;
+        }
+        for t in n {
+            order[t] = buf[t];
+        }
+        width *= 2;
+    }
+    for a in j - 1 {
+        h1 := order[a];
+        mut b = a + 1;
+        while b < j {
+            h2 := order[b];
+            b += 1;
+            if (c.ox[c.hs_left[h2]] >= c.ox[c.hs_right[h1]]) || (c.hs_ltr[h2] == c.hs_ltr[h1])
+                || (c.ox[c.hs_right[h2]] <= c.ox[c.hs_left[h1]]) {
+                continue;
+            }
+            curr_y := c.oy[c.hs_left[h1]];
+            if c.hs_ltr[h1] {
+                while (c.oy[c.onext[c.hs_left[h1]]] == curr_y) && (c.ox[c.onext[c.hs_left[h1]]] <= c.ox[c.hs_left[h2]]) {
+                    nl := c.onext[c.hs_left[h1]];
+                    c.hs_left[h1] = nl;
+                }
+                while (c.oy[c.oprev[c.hs_left[h2]]] == curr_y) && (c.ox[c.oprev[c.hs_left[h2]]] <= c.ox[c.hs_left[h1]]) {
+                    pl := c.oprev[c.hs_left[h2]];
+                    c.hs_left[h2] = pl;
+                }
+                l1 := c.hs_left[h1];
+                l2 := c.hs_left[h2];
+                d1 := duplicate_op(&mut c, l1, true);
+                d2 := duplicate_op(&mut c, l2, false);
+                c.hj_op1.push(d1);
+                c.hj_op2.push(d2);
+            } else {
+                while (c.oy[c.oprev[c.hs_left[h1]]] == curr_y) && (c.ox[c.oprev[c.hs_left[h1]]] <= c.ox[c.hs_left[h2]]) {
+                    pl := c.oprev[c.hs_left[h1]];
+                    c.hs_left[h1] = pl;
+                }
+                while (c.oy[c.onext[c.hs_left[h2]]] == curr_y) && (c.ox[c.onext[c.hs_left[h2]]] <= c.ox[c.hs_left[h1]]) {
+                    nl := c.onext[c.hs_left[h2]];
+                    c.hs_left[h2] = nl;
+                }
+                l1 := c.hs_left[h1];
+                l2 := c.hs_left[h2];
+                d2 := duplicate_op(&mut c, l2, true);
+                d1 := duplicate_op(&mut c, l1, false);
+                c.hj_op1.push(d2);
+                c.hj_op2.push(d1);
+            }
+        }
+    }
+}
+fn move_splits<a>(c: (&a mut Clip), from: u64, to: u64) {
+    for i in c.r_splits[from].len() {
+        s := c.r_splits[from][i];
+        if s != to {
+            push_split(&mut c, to, s);
+        }
+    }
+    c.r_splits[from] = u64[];
+}
+fn process_horz_joins<a>(c: (&a mut Clip)) {
+    for k in c.hj_op1.len() {
+        op1 := c.hj_op1[k];
+        op2 := c.hj_op2[k];
+        or1 := real_outrec(&c, c.orec[op1]);
+        mut or2 = real_outrec(&c, c.orec[op2]);
+        op1b := c.onext[op1];
+        op2b := c.oprev[op2];
+        c.onext[op1] = op2;
+        c.oprev[op2] = op1;
+        c.oprev[op1b] = op2b;
+        c.onext[op2b] = op1b;
+        if or1 == or2 {
+            or2 = new_outrec(&mut c);
+            c.r_pts[or2] = op1b;
+            fix_outrec_pts(&mut c, or2);
+            if c.orec[c.r_pts[or1]] == or2 {
+                c.r_pts[or1] = op1;
+                c.orec[op1] = or1;
+            }
+            if c.using_polytree {
+                if path2_contains_path1(&c, c.r_pts[or1], c.r_pts[or2]) {
+                    t := c.r_pts[or1];
+                    p2 := c.r_pts[or2];
+                    c.r_pts[or1] = p2;
+                    c.r_pts[or2] = t;
+                    fix_outrec_pts(&mut c, or1);
+                    fix_outrec_pts(&mut c, or2);
+                    c.r_owner[or2] = or1;
+                } else {
+                    if path2_contains_path1(&c, c.r_pts[or2], c.r_pts[or1]) {
+                        c.r_owner[or2] = or1;
+                    } else {
+                        o := c.r_owner[or1];
+                        c.r_owner[or2] = o;
+                    }
+                }
+                push_split(&mut c, or1, or2);
+            } else {
+                c.r_owner[or2] = or1;
+            }
+        } else {
+            c.r_pts[or2] = NIL;
+            if c.using_polytree {
+                set_owner(&mut c, or2, or1);
+                if c.r_splits[or2].len() != 0 {
+                    move_splits(&mut c, or2, or1);
+                }
+            } else {
+                c.r_owner[or2] = or1;
+            }
+        }
+    }
+}
+
+fn do_intersections<a>(c: (&a mut Clip), top_y: i64) {
+    if build_intersect_list(&mut c, top_y) {
+        process_intersect_list(&mut c);
+        c.in_x = i64[];
+        c.in_y = i64[];
+        c.in_e1 = u64[];
+        c.in_e2 = u64[];
+    }
+}
+fn closest_point_on_segment(off: Pt, s1: Pt, s2: Pt) -> Pt {
+    if (s1.x == s2.x) && (s1.y == s2.y) {
+        return Pt { x: s1.x, y: s1.y };
+    }
+    dx := f64(s2.x - s1.x);
+    dy := f64(s2.y - s1.y);
+    mut q = (f64(off.x - s1.x) * dx + f64(off.y - s1.y) * dy) / (sqr(dx) + sqr(dy));
+    if q < 0.0 {
+        q = 0.0;
+    } else {
+        if q > 1.0 {
+            q = 1.0;
+        }
+    }
+    return Pt { x: s1.x + nearbyint(q * dx), y: s1.y + nearbyint(q * dy) };
+}
+fn add_new_intersect_node<a>(c: (&a mut Clip), e1: u64, e2: u64, top_y: i64) {
+    h := line_intersect(ebot(&c, e1), etop(&c, e1), ebot(&c, e2), etop(&c, e2));
+    mut ip = Pt { x: h.x, y: h.y };
+    if h.ok == false {
+        ip = Pt { x: c.ecx[e1], y: top_y };
+    }
+    if (ip.y > c.bot_y) || (ip.y < top_y) {
+        a1 := c.edx[e1].abs();
+        a2 := c.edx[e2].abs();
+        if (a1 > 100.0) && (a2 > 100.0) {
+            if a1 > a2 {
+                ip = closest_point_on_segment(ip, ebot(&c, e1), etop(&c, e1));
+            } else {
+                ip = closest_point_on_segment(ip, ebot(&c, e2), etop(&c, e2));
+            }
+        } else {
+            if a1 > 100.0 {
+                ip = closest_point_on_segment(ip, ebot(&c, e1), etop(&c, e1));
+            } else {
+                if a2 > 100.0 {
+                    ip = closest_point_on_segment(ip, ebot(&c, e2), etop(&c, e2));
+                } else {
+                    mut y = c.bot_y;
+                    if ip.y < top_y {
+                        y = top_y;
+                    }
+                    mut x = top_x(&c, e2, y);
+                    if a1 < a2 {
+                        x = top_x(&c, e1, y);
+                    }
+                    ip = Pt { x: x, y: y };
+                }
+            }
+        }
+    }
+    c.in_x.push(ip.x);
+    c.in_y.push(ip.y);
+    c.in_e1.push(e1);
+    c.in_e2.push(e2);
+}
+fn build_intersect_list<a>(c: (&a mut Clip), top_y: i64) -> bool {
+    if (c.actives == NIL) || (c.enext[c.actives] == NIL) {
+        return false;
+    }
+    adjust_curr_x_and_copy_to_sel(&mut c, top_y);
+    mut left = c.sel;
+    while (left != NIL) && (c.ejump[left] != NIL) {
+        mut prev_base = NIL;
+        while (left != NIL) && (c.ejump[left] != NIL) {
+            mut curr_base = left;
+            mut right = c.ejump[left];
+            mut l_end = right;
+            r_end := c.ejump[right];
+            c.ejump[left] = r_end;
+            while (left != l_end) && (right != r_end) {
+                if c.ecx[right] < c.ecx[left] {
+                    mut tmp = c.epsel[right];
+                    loop {
+                        add_new_intersect_node(&mut c, tmp, right, top_y);
+                        if tmp == left {
+                            break;
+                        }
+                        tmp = c.epsel[tmp];
+                    }
+                    tmp = right;
+                    right = extract_from_sel(&mut c, tmp);
+                    l_end = right;
+                    insert1_before2_in_sel(&mut c, tmp, left);
+                    if left == curr_base {
+                        curr_base = tmp;
+                        c.ejump[curr_base] = r_end;
+                        if prev_base == NIL {
+                            c.sel = curr_base;
+                        } else {
+                            c.ejump[prev_base] = curr_base;
+                        }
+                    }
+                } else {
+                    left = c.ensel[left];
+                }
+            }
+            prev_base = curr_base;
+            left = r_end;
+        }
+        left = c.sel;
+    }
+    return c.in_x.len() > 0;
+}
+// IntersectListSort: descending y, then ascending x.
+fn in_before<a>(c: (&a Clip), a: u64, b: u64) -> bool {
+    if c.in_y[a] == c.in_y[b] {
+        return c.in_x[a] < c.in_x[b];
+    }
+    return c.in_y[a] > c.in_y[b];
+}
+fn process_intersect_list<a>(c: (&a mut Clip)) {
+    // std::sort (libstdc++ introsort) so that ties order exactly as the reference does.
+    n := c.in_x.len();
+    mut order = u64[];
+    for i in n {
+        order.push(i);
+    }
+    std_sort_nodes(&c, &mut order);
+    for i in n {
+        if edges_adjacent_in_ael(&c, order[i]) == false {
+            mut j = i + 1;
+            while edges_adjacent_in_ael(&c, order[j]) == false {
+                j += 1;
+            }
+            t := order[i];
+            order[i] = order[j];
+            order[j] = t;
+        }
+        node := order[i];
+        e1 := c.in_e1[node];
+        e2 := c.in_e2[node];
+        pt := Pt { x: c.in_x[node], y: c.in_y[node] };
+        intersect_edges(&mut c, e1, e2, Pt { x: pt.x, y: pt.y });
+        swap_positions_in_ael(&mut c, e1, e2);
+        c.ecx[e1] = pt.x;
+        c.ecx[e2] = pt.x;
+        check_join_left(&mut c, e2, Pt { x: pt.x, y: pt.y }, true);
+        check_join_right(&mut c, e1, Pt { x: pt.x, y: pt.y }, true);
+    }
+}
+fn swap_positions_in_ael<a>(c: (&a mut Clip), e1: u64, e2: u64) {
+    nx := c.enext[e2];
+    if nx != NIL {
+        c.eprev[nx] = e1;
+    }
+    pv := c.eprev[e1];
+    if pv != NIL {
+        c.enext[pv] = e2;
+    }
+    c.eprev[e2] = pv;
+    c.enext[e2] = e1;
+    c.eprev[e1] = e2;
+    c.enext[e1] = nx;
+    if c.eprev[e2] == NIL {
+        c.actives = e2;
+    }
+}
+fn last_op<a>(c: (&a Clip), e: u64) -> u64 {
+    rec := c.erec[e];
+    mut r = c.r_pts[rec];
+    if e != c.r_front[rec] {
+        r = c.onext[r];
+    }
+    return r;
+}
+fn add_trial_horz_join<a>(c: (&a mut Clip), op: u64) {
+    if c.r_open[c.orec[op]] {
+        return ();
+    }
+    c.hs_left.push(op);
+    c.hs_right.push(NIL);
+    c.hs_ltr.push(true);
+}
+// Returns left-to-right; horizontal extent through c.h_left / c.h_right.
+struct Span {
+    ltr: bool,
+    left: i64,
+    right: i64
+}
+fn reset_horz_direction<a>(c: (&a Clip), horz: u64, max_v: u64) -> Span {
+    if c.ebx[horz] == c.etx[horz] {
+        mut e = c.enext[horz];
+        while (e != NIL) && (c.evtop[e] != max_v) {
+            e = c.enext[e];
+        }
+        return Span { ltr: e != NIL, left: c.ecx[horz], right: c.ecx[horz] };
+    }
+    if c.ecx[horz] < c.etx[horz] {
+        return Span { ltr: true, left: c.ecx[horz], right: c.etx[horz] };
+    }
+    return Span { ltr: false, left: c.etx[horz], right: c.ecx[horz] };
+}
+fn do_horizontal<a>(c: (&a mut Clip), horz: u64) {
+    horz_open := is_open(&c, horz);
+    y := c.eby[horz];
+    mut max_v = NIL;
+    if horz_open {
+        max_v = curr_y_maxima_vertex_open(&c, horz);
+    } else {
+        max_v = curr_y_maxima_vertex(&c, horz);
+    }
+    mut span = reset_horz_direction(&c, horz, max_v);
+    if is_hot(&c, horz) {
+        cx := c.ecx[horz];
+        op := add_out_pt(&mut c, horz, Pt { x: cx, y: y });
+        add_trial_horz_join(&mut c, op);
+    }
+    loop {
+        mut e = c.eprev[horz];
+        if span.ltr {
+            e = c.enext[horz];
+        }
+        while e != NIL {
+            if c.evtop[e] == max_v {
+                if is_hot(&c, horz) && is_joined(&c, e) {
+                    h1 := etop(&c, e);
+                    split(&mut c, e, h1);
+                }
+                if is_hot(&c, horz) {
+                    while c.evtop[horz] != max_v {
+                        h2 := etop(&c, horz);
+                        add_out_pt(&mut c, horz, h2);
+                        update_edge_into_ael(&mut c, horz);
+                    }
+                    if span.ltr {
+                        h3 := etop(&c, horz);
+                        add_local_max_poly(&mut c, horz, e, h3);
+                    } else {
+                        h4 := etop(&c, horz);
+                        add_local_max_poly(&mut c, e, horz, h4);
+                    }
+                }
+                delete_from_ael(&mut c, e);
+                delete_from_ael(&mut c, horz);
+                return ();
+            }
+            if (max_v != c.evtop[horz]) || is_open_end(&c, horz) {
+                if (span.ltr && (c.ecx[e] > span.right)) || ((span.ltr == false) && (c.ecx[e] < span.left)) {
+                    break;
+                }
+                if (c.ecx[e] == c.etx[horz]) && (is_horizontal(&c, e) == false) {
+                    nv := next_vertex(&c, horz);
+                    px := c.vx[nv];
+                    py := c.vy[nv];
+                    if span.ltr {
+                        if is_open(&c, e) && (same_poly_type(&c, e, horz) == false) && (is_hot(&c, e) == false) {
+                            if top_x(&c, e, py) > px {
+                                break;
+                            }
+                        } else {
+                            if top_x(&c, e, py) >= px {
+                                break;
+                            }
+                        }
+                    } else {
+                        if is_open(&c, e) && (same_poly_type(&c, e, horz) == false) && (is_hot(&c, e) == false) {
+                            if top_x(&c, e, py) < px {
+                                break;
+                            }
+                        } else {
+                            if top_x(&c, e, py) <= px {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            pt := Pt { x: c.ecx[e], y: c.eby[horz] };
+            if span.ltr {
+                intersect_edges(&mut c, horz, e, Pt { x: pt.x, y: pt.y });
+                swap_positions_in_ael(&mut c, horz, e);
+                check_join_left(&mut c, e, Pt { x: pt.x, y: pt.y }, false);
+                x := c.ecx[e];
+                c.ecx[horz] = x;
+                e = c.enext[horz];
+            } else {
+                intersect_edges(&mut c, e, horz, Pt { x: pt.x, y: pt.y });
+                swap_positions_in_ael(&mut c, e, horz);
+                check_join_right(&mut c, e, Pt { x: pt.x, y: pt.y }, false);
+                x := c.ecx[e];
+                c.ecx[horz] = x;
+                e = c.eprev[horz];
+            }
+            if c.erec[horz] != NIL {
+                lo := last_op(&c, horz);
+                add_trial_horz_join(&mut c, lo);
+            }
+        }
+        if horz_open && is_open_end(&c, horz) {
+            if is_hot(&c, horz) {
+                h5 := etop(&c, horz);
+                add_out_pt(&mut c, horz, h5);
+                r := c.erec[horz];
+                if is_front(&c, horz) {
+                    c.r_front[r] = NIL;
+                } else {
+                    c.r_back[r] = NIL;
+                }
+                c.erec[horz] = NIL;
+            }
+            delete_from_ael(&mut c, horz);
+            return ();
+        }
+        if c.vy[next_vertex(&c, horz)] != c.ety[horz] {
+            break;
+        }
+        if is_hot(&c, horz) {
+            h6 := etop(&c, horz);
+            add_out_pt(&mut c, horz, h6);
+        }
+        update_edge_into_ael(&mut c, horz);
+        span = reset_horz_direction(&c, horz, max_v);
+    }
+    if is_hot(&c, horz) {
+        h7 := etop(&c, horz);
+        op := add_out_pt(&mut c, horz, h7);
+        add_trial_horz_join(&mut c, op);
+    }
+    update_edge_into_ael(&mut c, horz);
+}
+fn do_top_of_scanbeam<a>(c: (&a mut Clip), y: i64) {
+    c.sel = NIL;
+    mut e = c.actives;
+    while e != NIL {
+        if c.ety[e] == y {
+            tx := c.etx[e];
+            c.ecx[e] = tx;
+            if is_maxima(&c, e) {
+                e = do_maxima(&mut c, e);
+                continue;
+            }
+            if is_hot(&c, e) {
+                h8 := etop(&c, e);
+                add_out_pt(&mut c, e, h8);
+            }
+            update_edge_into_ael(&mut c, e);
+            if is_horizontal(&c, e) {
+                push_horz(&mut c, e);
+            }
+        } else {
+            x := top_x(&c, e, y);
+            c.ecx[e] = x;
+        }
+        e = c.enext[e];
+    }
+}
+fn do_maxima<a>(c: (&a mut Clip), e: u64) -> u64 {
+    prev_e := c.eprev[e];
+    mut next_e = c.enext[e];
+    if is_open_end(&c, e) {
+        if is_hot(&c, e) {
+            h9 := etop(&c, e);
+            add_out_pt(&mut c, e, h9);
+        }
+        if is_horizontal(&c, e) == false {
+            if is_hot(&c, e) {
+                r := c.erec[e];
+                if is_front(&c, e) {
+                    c.r_front[r] = NIL;
+                } else {
+                    c.r_back[r] = NIL;
+                }
+                c.erec[e] = NIL;
+            }
+            delete_from_ael(&mut c, e);
+        }
+        return next_e;
+    }
+    max_pair := maxima_pair(&c, e);
+    if max_pair == NIL {
+        return next_e;
+    }
+    if is_joined(&c, e) {
+        h10 := etop(&c, e);
+        split(&mut c, e, h10);
+    }
+    if is_joined(&c, max_pair) {
+        h11 := etop(&c, max_pair);
+        split(&mut c, max_pair, h11);
+    }
+    while next_e != max_pair {
+        h12 := etop(&c, e);
+        intersect_edges(&mut c, e, next_e, h12);
+        swap_positions_in_ael(&mut c, e, next_e);
+        next_e = c.enext[e];
+    }
+    if is_open(&c, e) {
+        if is_hot(&c, e) {
+            h13 := etop(&c, e);
+            add_local_max_poly(&mut c, e, max_pair, h13);
+        }
+        delete_from_ael(&mut c, max_pair);
+        delete_from_ael(&mut c, e);
+        if prev_e != NIL {
+            return c.enext[prev_e];
+        }
+        return c.actives;
+    }
+    if is_hot(&c, e) {
+        h14 := etop(&c, e);
+        add_local_max_poly(&mut c, e, max_pair, h14);
+    }
+    delete_from_ael(&mut c, e);
+    delete_from_ael(&mut c, max_pair);
+    if prev_e != NIL {
+        return c.enext[prev_e];
+    }
+    return c.actives;
+}
+
+fn split<a>(c: (&a mut Clip), e: u64, pt: Pt) {
+    if c.ejoin[e] == JOIN_RIGHT {
+        c.ejoin[e] = JOIN_NONE;
+        n := c.enext[e];
+        c.ejoin[n] = JOIN_NONE;
+        add_local_min_poly(&mut c, e, n, pt, true);
+    } else {
+        c.ejoin[e] = JOIN_NONE;
+        p := c.eprev[e];
+        c.ejoin[p] = JOIN_NONE;
+        add_local_min_poly(&mut c, p, e, pt, true);
+    }
+}
+fn check_join_left<a>(c: (&a mut Clip), e: u64, pt: Pt, check_curr_x: bool) {
+    pv := c.eprev[e];
+    if (pv == NIL) || (is_hot(&c, e) == false) || (is_hot(&c, pv) == false) || is_horizontal(&c, e)
+        || is_horizontal(&c, pv) || is_open(&c, e) || is_open(&c, pv) {
+        return ();
+    }
+    if ((pt.y < c.ety[e] + 2) || (pt.y < c.ety[pv] + 2)) && ((c.eby[e] > pt.y) || (c.eby[pv] > pt.y)) {
+        return ();
+    }
+    if check_curr_x {
+        if perp_dist_sqrd(Pt { x: pt.x, y: pt.y }, ebot(&c, pv), etop(&c, pv)) > 0.25 {
+            return ();
+        }
+    } else {
+        if c.ecx[e] != c.ecx[pv] {
+            return ();
+        }
+    }
+    if is_collinear(etop(&c, e), Pt { x: pt.x, y: pt.y }, etop(&c, pv)) == false {
+        return ();
+    }
+    if c.erec[e] == c.erec[pv] {
+        add_local_max_poly(&mut c, pv, e, pt);
+    } else {
+        if c.erec[e] < c.erec[pv] {
+            join_outrec_paths(&mut c, e, pv);
+        } else {
+            join_outrec_paths(&mut c, pv, e);
+        }
+    }
+    c.ejoin[pv] = JOIN_RIGHT;
+    c.ejoin[e] = JOIN_LEFT;
+}
+fn check_join_right<a>(c: (&a mut Clip), e: u64, pt: Pt, check_curr_x: bool) {
+    nx := c.enext[e];
+    if (nx == NIL) || (is_hot(&c, e) == false) || (is_hot(&c, nx) == false) || is_horizontal(&c, e)
+        || is_horizontal(&c, nx) || is_open(&c, e) || is_open(&c, nx) {
+        return ();
+    }
+    if ((pt.y < c.ety[e] + 2) || (pt.y < c.ety[nx] + 2)) && ((c.eby[e] > pt.y) || (c.eby[nx] > pt.y)) {
+        return ();
+    }
+    if check_curr_x {
+        if perp_dist_sqrd(Pt { x: pt.x, y: pt.y }, ebot(&c, nx), etop(&c, nx)) > 0.35 {
+            return ();
+        }
+    } else {
+        if c.ecx[e] != c.ecx[nx] {
+            return ();
+        }
+    }
+    if is_collinear(etop(&c, e), Pt { x: pt.x, y: pt.y }, etop(&c, nx)) == false {
+        return ();
+    }
+    if c.erec[e] == c.erec[nx] {
+        add_local_max_poly(&mut c, e, nx, pt);
+    } else {
+        if c.erec[e] < c.erec[nx] {
+            join_outrec_paths(&mut c, e, nx);
+        } else {
+            join_outrec_paths(&mut c, nx, e);
+        }
+    }
+    c.ejoin[e] = JOIN_RIGHT;
+    c.ejoin[nx] = JOIN_LEFT;
+}
+
+fn build_path<a>(c: (&a Clip), op_in: u64, reverse: bool, open: bool) -> XY {
+    mut out = XY { x: i64[], y: i64[] };
+    mut op = op_in;
+    if (op == NIL) || (c.onext[op] == op) || ((open == false) && (c.onext[op] == c.oprev[op])) {
+        return out;
+    }
+    mut last = Pt { x: 0, y: 0 };
+    mut op2 = NIL;
+    if reverse {
+        last = opt(&c, op);
+        op2 = c.oprev[op];
+    } else {
+        op = c.onext[op];
+        last = opt(&c, op);
+        op2 = c.onext[op];
+    }
+    out.x.push(last.x);
+    out.y.push(last.y);
+    while op2 != op {
+        if (c.ox[op2] != last.x) || (c.oy[op2] != last.y) {
+            last = opt(&c, op2);
+            out.x.push(last.x);
+            out.y.push(last.y);
+        }
+        if reverse {
+            op2 = c.oprev[op2];
+        } else {
+            op2 = c.onext[op2];
+        }
+    }
+    if (open == false) && (out.x.len() == 3) && is_very_small_triangle(&c, op2) {
+        return XY { x: i64[], y: i64[] };
+    }
+    return out;
+}
+
+// ---- public API ----
+pub fn new() -> Clip {
+    return Clip {
+        vx: i64[], vy: i64[], vnext: u64[], vprev: u64[], vflags: u64[],
+        lm_v: u64[], lm_type: u64[], lm_open: bool[], lm_order: u64[], lm_cur: 0, lm_sorted: false,
+        ox: i64[], oy: i64[], onext: u64[], oprev: u64[], orec: u64[], ohorz: u64[],
+        r_owner: u64[], r_front: u64[], r_back: u64[], r_pts: u64[], r_splits: u64[][],
+        r_rsplit: u64[], r_left: i64[], r_top: i64[], r_right: i64[], r_bottom: i64[],
+        r_px: i64[][], r_py: i64[][], r_open: bool[], r_polypath: u64[],
+        ebx: i64[], eby: i64[], etx: i64[], ety: i64[], ecx: i64[], edx: f64[], ewdx: i64[],
+        ewc: i64[], ewc2: i64[], erec: u64[], eprev: u64[], enext: u64[], epsel: u64[],
+        ensel: u64[], ejump: u64[], evtop: u64[], elm: u64[], eleft: bool[], ejoin: u64[],
+        in_x: i64[], in_y: i64[], in_e1: u64[], in_e2: u64[],
+        hs_left: u64[], hs_right: u64[], hs_ltr: bool[], hj_op1: u64[], hj_op2: u64[],
+        scan: i64[], actives: NIL, sel: NIL, cliptype: CLIP_NONE, fillrule: FILL_EVEN_ODD, bot_y: 0,
+        using_polytree: false, preserve_collinear: true, reverse_solution: false,
+        has_open_paths: false, succeeded: true, error_code: 0
+    };
+}
+pub struct Path {
+    x: i64[],
+    y: i64[]
+}
+fn to_xy(paths: Path[]) -> XY[] {
+    mut out = XY[];
+    mut rest = paths;
+    mut tmp = Path[];
+    while rest.len() > 0 {
+        tmp.push(rest.pop());
+    }
+    while tmp.len() > 0 {
+        p := tmp.pop();
+        out.push(XY { x: p.x, y: p.y });
+    }
+    return out;
+}
+pub fn add_subject<a>(c: (&a mut Clip), paths: Path[]) {
+    xy := to_xy(paths);
+    add_paths_(&mut c, &xy, SUBJECT, false);
+}
+pub fn add_clip<a>(c: (&a mut Clip), paths: Path[]) {
+    xy := to_xy(paths);
+    add_paths_(&mut c, &xy, CLIP, false);
+}
+pub fn add_open_subject<a>(c: (&a mut Clip), paths: Path[]) {
+    xy := to_xy(paths);
+    add_paths_(&mut c, &xy, SUBJECT, true);
+}
+
+fn execute_internal<a>(c: (&a mut Clip), ct: u64, fill: u64) -> bool {
+    c.using_polytree = false;
+    return execute_internal_with(&mut c, ct, fill);
+}
+fn execute_internal_tree<a>(c: (&a mut Clip), ct: u64, fill: u64) -> bool {
+    c.using_polytree = true;
+    return execute_internal_with(&mut c, ct, fill);
+}
+fn execute_internal_with<a>(c: (&a mut Clip), ct: u64, fill: u64) -> bool {
+    c.cliptype = ct;
+    c.fillrule = fill;
+    reset(&mut c);
+    first := pop_scanline(&mut c);
+    if (ct == CLIP_NONE) || (first.ok == false) {
+        return true;
+    }
+    mut y = first.y;
+    while c.succeeded {
+        insert_local_minima_into_ael(&mut c, y);
+        mut e = pop_horz(&mut c);
+        while e != NIL {
+            do_horizontal(&mut c, e);
+            e = pop_horz(&mut c);
+        }
+        if c.hs_left.len() > 0 {
+            convert_horz_segs_to_joins(&mut c);
+            c.hs_left = u64[];
+            c.hs_right = u64[];
+            c.hs_ltr = bool[];
+        }
+        c.bot_y = y;
+        next := pop_scanline(&mut c);
+        if next.ok == false {
+            break;
+        }
+        y = next.y;
+        do_intersections(&mut c, y);
+        do_top_of_scanbeam(&mut c, y);
+        e = pop_horz(&mut c);
+        while e != NIL {
+            do_horizontal(&mut c, e);
+            e = pop_horz(&mut c);
+        }
+    }
+    if c.succeeded {
+        process_horz_joins(&mut c);
+    }
+    return c.succeeded;
+}
+
+// Runs the clip and returns the closed solution paths (Clipper64::Execute without a polytree).
+pub fn execute<a>(c: (&a mut Clip), ct: u64, fill: u64) -> Path[] {
+    mut out = Path[];
+    if execute_internal(&mut c, ct, fill) == false {
+        return out;
+    }
+    // outrec_list_.size() is re-read each iteration: cleaning can split off new outrecs.
+    mut i: u64 = 0;
+    while i < c.r_pts.len() {
+        if (c.r_pts[i] != NIL) && (c.r_open[i] == false) {
+            clean_collinear(&mut c, i);
+            p := build_path(&c, c.r_pts[i], c.reverse_solution, false);
+            if p.x.len() > 0 {
+                out.push(Path { x: p.x, y: p.y });
+            }
+        }
+        i += 1;
+    }
+    return out;
+}
+
+fn insert_local_minima_into_ael<a>(c: (&a mut Clip), bot_y: i64) {
+    mut lm = pop_local_minima(&mut c, bot_y);
+    while lm != NIL {
+        v := c.lm_v[lm];
+        mut left = NIL;
+        mut right = NIL;
+        if (c.vflags[v] & VF_OPEN_START) == 0 {
+            vp := c.vprev[v];
+            left = new_active(&mut c, lm, -1, vp);
+        }
+        if (c.vflags[v] & VF_OPEN_END) == 0 {
+            vn := c.vnext[v];
+            right = new_active(&mut c, lm, 1, vn);
+        }
+        if (left != NIL) && (right != NIL) {
+            if is_horizontal(&c, left) {
+                if heading_right_horz(&c, left) {
+                    t := left;
+                    left = right;
+                    right = t;
+                }
+            } else {
+                if is_horizontal(&c, right) {
+                    if heading_left_horz(&c, right) {
+                        t := left;
+                        left = right;
+                        right = t;
+                    }
+                } else {
+                    if c.edx[left] < c.edx[right] {
+                        t := left;
+                        left = right;
+                        right = t;
+                    }
+                }
+            }
+        } else {
+            if left == NIL {
+                left = right;
+                right = NIL;
+            }
+        }
+        c.eleft[left] = true;
+        insert_left_edge(&mut c, left);
+        mut contributing = false;
+        if is_open(&c, left) {
+            set_wind_count_open(&mut c, left);
+            contributing = is_contributing_open(&c, left);
+        } else {
+            set_wind_count_closed(&mut c, left);
+            contributing = is_contributing_closed(&c, left);
+        }
+        if right != NIL {
+            c.eleft[right] = false;
+            w := c.ewc[left];
+            w2 := c.ewc2[left];
+            c.ewc[right] = w;
+            c.ewc2[right] = w2;
+            insert_right_edge(&mut c, left, right);
+            if contributing {
+                h15 := ebot(&c, left);
+                add_local_min_poly(&mut c, left, right, h15, true);
+                if is_horizontal(&c, left) == false {
+                    h16 := ebot(&c, left);
+                    check_join_left(&mut c, left, h16, false);
+                }
+            }
+            while (c.enext[right] != NIL) && is_valid_ael_order(&c, c.enext[right], right) {
+                n := c.enext[right];
+                h17 := ebot(&c, right);
+                intersect_edges(&mut c, right, n, h17);
+                swap_positions_in_ael(&mut c, right, n);
+            }
+            if is_horizontal(&c, right) {
+                push_horz(&mut c, right);
+            } else {
+                h18 := ebot(&c, right);
+                check_join_right(&mut c, right, h18, false);
+                ty := c.ety[right];
+                insert_scanline(&mut c, ty);
+            }
+        } else {
+            if contributing {
+                h19 := ebot(&c, left);
+                start_open_path(&mut c, left, h19);
+            }
+        }
+        if is_horizontal(&c, left) {
+            push_horz(&mut c, left);
+        } else {
+            ty := c.ety[left];
+            insert_scanline(&mut c, ty);
+        }
+        lm = pop_local_minima(&mut c, bot_y);
+    }
+}
+
+// An empty path list and a builder, for callers outside this module.
+pub fn paths() -> Path[] {
+    return Path[];
+}
+pub fn path(x: i64[], y: i64[]) -> Path {
+    return Path { x: x, y: y };
+}
+pub fn push_path<a>(list: (&a mut Path[]), x: i64[], y: i64[]) {
+    list.push(Path { x: x, y: y });
+}
+
+// ---- libstdc++ std::sort, specialised to intersection nodes (IntersectListSort) ----
+// introsort: median-of-three quicksort above 16 elements, heap sort when the depth budget
+// (2*floor(log2 n)) runs out, then a final insertion sort. Reproduced step for step because
+// std::sort is not stable and Clipper2's output order depends on how it breaks ties.
+fn std_sort_nodes<a, b>(c: (&a Clip), v: (&b mut u64[])) {
+    n := v.len();
+    if n < 2 {
+        return ();
+    }
+    mut lg: u64 = 0;
+    mut m = n;
+    while m > 1 {
+        m = m / 2;
+        lg += 1;
+    }
+    introsort_loop(&c, &mut v, 0, n, lg * 2);
+    if n > 16 {
+        insertion_sort(&c, &mut v, 0, 16);
+        mut i: u64 = 16;
+        while i < n {
+            unguarded_linear_insert(&c, &mut v, i);
+            i += 1;
+        }
+    } else {
+        insertion_sort(&c, &mut v, 0, n);
+    }
+}
+fn introsort_loop<a, b>(c: (&a Clip), v: (&b mut u64[]), first: u64, last_in: u64, depth_in: u64) {
+    mut last = last_in;
+    mut depth = depth_in;
+    while last - first > 16 {
+        if depth == 0 {
+            heap_sort_range(&c, &mut v, first, last);
+            return ();
+        }
+        depth -= 1;
+        mid := first + (last - first) / 2;
+        move_median_to_first(&c, &mut v, first, Tri4 { a: first + 1, b: mid, c: last - 1 });
+        cut := unguarded_partition(&c, &mut v, first + 1, last, first);
+        introsort_loop(&c, &mut v, cut, last, depth);
+        last = cut;
+    }
+}
+struct Tri4 {
+    a: u64,
+    b: u64,
+    c: u64
+}
+fn sw<b>(v: (&b mut u64[]), i: u64, j: u64) {
+    t := v[i];
+    v[i] = v[j];
+    v[j] = t;
+}
+fn lt_at<a, b>(c: (&a Clip), v: (&b u64[]), i: u64, j: u64) -> bool {
+    return in_before(&c, v[i], v[j]);
+}
+fn move_median_to_first<a, b>(c: (&a Clip), v: (&b mut u64[]), result: u64, t: Tri4) {
+    if lt_at(&c, &v, t.a, t.b) {
+        if lt_at(&c, &v, t.b, t.c) {
+            sw(&mut v, result, t.b);
+        } else {
+            if lt_at(&c, &v, t.a, t.c) {
+                sw(&mut v, result, t.c);
+            } else {
+                sw(&mut v, result, t.a);
+            }
+        }
+    } else {
+        if lt_at(&c, &v, t.a, t.c) {
+            sw(&mut v, result, t.a);
+        } else {
+            if lt_at(&c, &v, t.b, t.c) {
+                sw(&mut v, result, t.c);
+            } else {
+                sw(&mut v, result, t.b);
+            }
+        }
+    }
+}
+fn unguarded_partition<a, b>(c: (&a Clip), v: (&b mut u64[]), first_in: u64, last_in: u64, pivot: u64) -> u64 {
+    mut first = first_in;
+    mut last = last_in;
+    loop {
+        while lt_at(&c, &v, first, pivot) {
+            first += 1;
+        }
+        last -= 1;
+        while lt_at(&c, &v, pivot, last) {
+            last -= 1;
+        }
+        if (first < last) == false {
+            return first;
+        }
+        sw(&mut v, first, last);
+        first += 1;
+    }
+}
+fn insertion_sort<a, b>(c: (&a Clip), v: (&b mut u64[]), first: u64, last: u64) {
+    if first == last {
+        return ();
+    }
+    mut i = first + 1;
+    while i < last {
+        if in_before(&c, v[i], v[first]) {
+            val := v[i];
+            mut k = i;
+            while k > first {
+                v[k] = v[k - 1];
+                k -= 1;
+            }
+            v[first] = val;
+        } else {
+            unguarded_linear_insert(&c, &mut v, i);
+        }
+        i += 1;
+    }
+}
+fn unguarded_linear_insert<a, b>(c: (&a Clip), v: (&b mut u64[]), last_in: u64) {
+    mut last = last_in;
+    val := v[last];
+    mut next = last - 1;
+    while in_before(&c, val, v[next]) {
+        v[last] = v[next];
+        last = next;
+        next -= 1;
+    }
+    v[last] = val;
+}
+// std::partial_sort(first, last, last): make_heap then sort_heap.
+fn heap_sort_range<a, b>(c: (&a Clip), v: (&b mut u64[]), first: u64, last_in: u64) {
+    len := last_in - first;
+    if len >= 2 {
+        mut parent = (len - 2) / 2;
+        loop {
+            val := v[first + parent];
+            adjust_heap(&c, &mut v, first, Tri4 { a: parent, b: len, c: val });
+            if parent == 0 {
+                break;
+            }
+            parent -= 1;
+        }
+    }
+    mut last = last_in;
+    while last - first > 1 {
+        last -= 1;
+        val := v[last];
+        v[last] = v[first];
+        adjust_heap(&c, &mut v, first, Tri4 { a: 0, b: last - first, c: val });
+    }
+}
+// __adjust_heap(first, hole, len, value) with t = (hole, len, value).
+fn adjust_heap<a, b>(c: (&a Clip), v: (&b mut u64[]), first: u64, t: Tri4) {
+    mut hole = t.a;
+    len := t.b;
+    value := t.c;
+    top := hole;
+    mut second = hole;
+    while second < (len - 1) / 2 {
+        second = 2 * (second + 1);
+        if in_before(&c, v[first + second], v[first + second - 1]) {
+            second -= 1;
+        }
+        v[first + hole] = v[first + second];
+        hole = second;
+    }
+    if ((len & 1) == 0) && (second == (len - 2) / 2) {
+        second = 2 * (second + 1);
+        v[first + hole] = v[first + second - 1];
+        hole = second - 1;
+    }
+    // __push_heap
+    mut parent: u64 = 0;
+    if hole > 0 {
+        parent = (hole - 1) / 2;
+    }
+    while (hole > top) && in_before(&c, v[first + parent], value) {
+        v[first + hole] = v[first + parent];
+        hole = parent;
+        if hole > 0 {
+            parent = (hole - 1) / 2;
+        }
+    }
+    v[first + hole] = value;
+}
+
+// ---- polytree (PolyTree64 / PolyTreeD) ----
+// Node 0 is the root (no polygon). Children of a node are the nodes whose parent it is, in
+// creation (AddChild) order. Level and IsHole follow the reference: a node is a hole when its
+// depth below the root is even and non-zero.
+pub struct Tree {
+    parent: u64[],
+    x: f64[][],
+    y: f64[][]
+}
+fn tree_new() -> Tree {
+    return Tree { parent: u64[NIL], x: f64[][f64[]], y: f64[][f64[]] };
+}
+pub fn tree_count<a>(t: (&a Tree)) -> u64 {
+    return t.parent.len();
+}
+pub fn tree_level<a>(t: (&a Tree), node: u64) -> u64 {
+    mut lvl: u64 = 0;
+    mut p = t.parent[node];
+    while p != NIL {
+        lvl += 1;
+        p = t.parent[p];
+    }
+    return lvl;
+}
+pub fn tree_is_hole<a>(t: (&a Tree), node: u64) -> bool {
+    lvl := tree_level(&t, node);
+    return (lvl != 0) && ((lvl & 1) == 0);
+}
+fn tree_add<a>(t: (&a mut Tree), parent: u64, x: f64[], y: f64[]) -> u64 {
+    n := t.parent.len();
+    t.parent.push(parent);
+    t.x.push(x);
+    t.y.push(y);
+    return n;
+}
+
+fn rect_empty<a>(c: (&a Clip), r: u64) -> bool {
+    return (c.r_bottom[r] <= c.r_top[r]) || (c.r_right[r] <= c.r_left[r]);
+}
+fn rect_contains<a>(c: (&a Clip), outer: u64, inner: u64) -> bool {
+    return (c.r_left[inner] >= c.r_left[outer]) && (c.r_right[inner] <= c.r_right[outer])
+        && (c.r_top[inner] >= c.r_top[outer]) && (c.r_bottom[inner] <= c.r_bottom[outer]);
+}
+fn check_bounds<a>(c: (&a mut Clip), rec: u64) -> bool {
+    if c.r_pts[rec] == NIL {
+        return false;
+    }
+    if rect_empty(&c, rec) == false {
+        return true;
+    }
+    clean_collinear(&mut c, rec);
+    if c.r_pts[rec] == NIL {
+        return false;
+    }
+    p := build_path(&c, c.r_pts[rec], c.reverse_solution, false);
+    if p.x.len() == 0 {
+        return false;
+    }
+    // GetBounds
+    mut l: i64 = 9223372036854775807;
+    mut t: i64 = 9223372036854775807;
+    mut r: i64 = -9223372036854775807 - 1;
+    mut b: i64 = -9223372036854775807 - 1;
+    for i in p.x.len() {
+        if p.x[i] < l {
+            l = p.x[i];
+        }
+        if p.x[i] > r {
+            r = p.x[i];
+        }
+        if p.y[i] < t {
+            t = p.y[i];
+        }
+        if p.y[i] > b {
+            b = p.y[i];
+        }
+    }
+    c.r_left[rec] = l;
+    c.r_top[rec] = t;
+    c.r_right[rec] = r;
+    c.r_bottom[rec] = b;
+    c.r_px[rec] = p.x;
+    c.r_py[rec] = p.y;
+    return true;
+}
+fn check_split_owner<a>(c: (&a mut Clip), rec: u64, splits_of: u64) -> bool {
+    splits := copy_u64s(&c.r_splits[splits_of]);
+    for idx in splits.len() {
+        mut sp = splits[idx];
+        if (c.r_pts[sp] == NIL) && (c.r_splits[sp].len() != 0) && check_split_owner(&mut c, rec, sp) {
+            return true;
+        }
+        sp = real_outrec(&c, sp);
+        if (sp == NIL) || (sp == rec) || (c.r_rsplit[sp] == rec) {
+            continue;
+        }
+        c.r_rsplit[sp] = rec;
+        if (c.r_splits[sp].len() != 0) && check_split_owner(&mut c, rec, sp) {
+            return true;
+        }
+        if (check_bounds(&mut c, sp) == false) || (rect_contains(&c, sp, rec) == false)
+            || (path2_contains_path1(&c, c.r_pts[rec], c.r_pts[sp]) == false) {
+            continue;
+        }
+        if is_valid_owner(&c, rec, sp) == false {
+            o := c.r_owner[rec];
+            c.r_owner[sp] = o;
+        }
+        c.r_owner[rec] = sp;
+        return true;
+    }
+    return false;
+}
+fn copy_u64s<a>(v: (&a u64[])) -> u64[] {
+    mut out = u64[];
+    for i in v.len() {
+        out.push(v[i]);
+    }
+    return out;
+}
+fn recursive_check_owners<a, b>(c: (&a mut Clip), rec: u64, tree: (&b mut Tree), inv: f64) {
+    if (c.r_polypath[rec] != NIL) || rect_empty(&c, rec) {
+        return ();
+    }
+    while c.r_owner[rec] != NIL {
+        o := c.r_owner[rec];
+        if (c.r_splits[o].len() != 0) && check_split_owner(&mut c, rec, o) {
+            break;
+        }
+        if (c.r_pts[o] != NIL) && check_bounds(&mut c, o) && rect_contains(&c, o, rec)
+            && path2_contains_path1(&c, c.r_pts[rec], c.r_pts[o]) {
+            break;
+        }
+        oo := c.r_owner[o];
+        c.r_owner[rec] = oo;
+    }
+    mut parent: u64 = 0;
+    if c.r_owner[rec] != NIL {
+        o := c.r_owner[rec];
+        if c.r_polypath[o] == NIL {
+            recursive_check_owners(&mut c, o, &mut tree, inv);
+        }
+        parent = c.r_polypath[o];
+    }
+    mut xs = f64[];
+    mut ys = f64[];
+    for i in c.r_px[rec].len() {
+        xs.push(f64(c.r_px[rec][i]) * inv);
+        ys.push(f64(c.r_py[rec][i]) * inv);
+    }
+    node := tree_add(&mut tree, parent, xs, ys);
+    c.r_polypath[rec] = node;
+}
+
+// ---- ClipperD: double coordinates scaled by a power of two ----
+pub struct PathD {
+    x: f64[],
+    y: f64[]
+}
+pub fn paths_d() -> PathD[] {
+    return PathD[];
+}
+pub fn push_path_d<a>(list: (&a mut PathD[]), x: f64[], y: f64[]) {
+    list.push(PathD { x: x, y: y });
+}
+pub struct ClipD {
+    clip: Clip,
+    scale: f64,
+    inv: f64
+}
+// scale = 2^(ilogb(10^precision) + 1), as ClipperD's constructor.
+pub fn new_d(precision: u64) -> ClipD {
+    mut p10 = 1.0;
+    for i in precision {
+        p10 = p10 * 10.0;
+    }
+    mut lg: i64 = 0;
+    mut v = p10;
+    while v >= 2.0 {
+        v = v / 2.0;
+        lg += 1;
+    }
+    mut scale = 1.0;
+    mut k: i64 = 0;
+    while k < lg + 1 {
+        scale = scale * 2.0;
+        k += 1;
+    }
+    return ClipD { clip: new(), scale: scale, inv: 1.0 / scale };
+}
+fn scale_in(paths: PathD[], scale: f64) -> XY[] {
+    mut out = XY[];
+    for i in paths.len() {
+        mut xs = i64[];
+        mut ys = i64[];
+        for j in paths[i].x.len() {
+            xs.push(round_away(paths[i].x[j] * scale));
+            ys.push(round_away(paths[i].y[j] * scale));
+        }
+        out.push(XY { x: xs, y: ys });
+    }
+    return out;
+}
+pub fn add_subject_d<a>(d: (&a mut ClipD), paths: PathD[]) {
+    xy := scale_in(paths, d.scale);
+    add_paths_(&mut d.clip, &xy, SUBJECT, false);
+}
+pub fn add_clip_d<a>(d: (&a mut ClipD), paths: PathD[]) {
+    xy := scale_in(paths, d.scale);
+    add_paths_(&mut d.clip, &xy, CLIP, false);
+}
+pub fn execute_d<a>(d: (&a mut ClipD), ct: u64, fill: u64) -> PathD[] {
+    inv := d.inv;
+    raw := execute(&mut d.clip, ct, fill);
+    mut out = PathD[];
+    for i in raw.len() {
+        mut xs = f64[];
+        mut ys = f64[];
+        for j in raw[i].x.len() {
+            xs.push(f64(raw[i].x[j]) * inv);
+            ys.push(f64(raw[i].y[j]) * inv);
+        }
+        out.push(PathD { x: xs, y: ys });
+    }
+    return out;
+}
+// Execute into a polytree (ClipperD::Execute with PolyTreeD; open paths are dropped).
+pub fn execute_tree_d<a>(d: (&a mut ClipD), ct: u64, fill: u64) -> Tree {
+    inv := d.inv;
+    mut tree = tree_new();
+    if execute_internal_tree(&mut d.clip, ct, fill) == false {
+        return tree;
+    }
+    mut i: u64 = 0;
+    while i < d.clip.r_pts.len() {
+        if (d.clip.r_pts[i] != NIL) && (d.clip.r_open[i] == false) {
+            if check_bounds(&mut d.clip, i) {
+                recursive_check_owners(&mut d.clip, i, &mut tree, inv);
+            }
+        }
+        i += 1;
+    }
+    return tree;
+}
+pub fn execute_tree<a>(c: (&a mut Clip), ct: u64, fill: u64) -> Tree {
+    mut tree = tree_new();
+    if execute_internal_tree(&mut c, ct, fill) == false {
+        return tree;
+    }
+    mut i: u64 = 0;
+    while i < c.r_pts.len() {
+        if (c.r_pts[i] != NIL) && (c.r_open[i] == false) {
+            if check_bounds(&mut c, i) {
+                recursive_check_owners(&mut c, i, &mut tree, 1.0);
+            }
+        }
+        i += 1;
+    }
+    return tree;
+}
+// Clipper2 Union(PathsD, FillRule, precision) and BooleanOp(PathsD, PathsD, precision).
+pub fn union_d(subjects: PathD[], fill: u64, precision: u64) -> PathD[] {
+    mut d = new_d(precision);
+    add_subject_d(&mut d, subjects);
+    return execute_d(&mut d, CLIP_UNION, fill);
+}
+pub fn boolean_op_d(ct: u64, fill: u64, subjects: PathD[], clips: PathD[], precision: u64) -> PathD[] {
+    mut d = new_d(precision);
+    add_subject_d(&mut d, subjects);
+    add_clip_d(&mut d, clips);
+    return execute_d(&mut d, ct, fill);
+}
+pub fn boolean_op_tree_d(ct: u64, fill: u64, subjects: PathD[], clips: PathD[], precision: u64) -> Tree {
+    mut d = new_d(precision);
+    add_subject_d(&mut d, subjects);
+    add_clip_d(&mut d, clips);
+    return execute_tree_d(&mut d, ct, fill);
+}
+
+// ---- path offsetting (ClipperOffset, InflatePaths) ----
+pub const JOIN_SQUARE: u64 = 0;
+pub const JOIN_BEVEL: u64 = 1;
+pub const JOIN_ROUND: u64 = 2;
+pub const JOIN_MITER: u64 = 3;
+pub const END_POLYGON: u64 = 0;
+pub const END_JOINED: u64 = 1;
+pub const END_BUTT: u64 = 2;
+pub const END_SQUARE: u64 = 3;
+pub const END_ROUND: u64 = 4;
+const PI: f64 = 3.141592653589793;
+const FP_TOL: f64 = 0.000000000001;
+const ARC_CONST: f64 = 0.002;
+
+struct Group {
+    paths: XY[],
+    lowest: u64,
+    reversed: bool,
+    join: u64,
+    end: u64
+}
+pub struct Offset {
+    groups: Group[],
+    delta: f64,
+    group_delta: f64,
+    temp_lim: f64,
+    steps_per_rad: f64,
+    step_sin: f64,
+    step_cos: f64,
+    nx: f64[],
+    ny: f64[],
+    out_x: i64[],
+    out_y: i64[],
+    solution: XY[],
+    join: u64,
+    end: u64,
+    miter_limit: f64,
+    arc_tolerance: f64,
+    preserve_collinear: bool,
+    reverse_solution: bool
+}
+pub fn new_offset(miter_limit: f64, arc_tolerance: f64) -> Offset {
+    return Offset {
+        groups: Group[], delta: 0.0, group_delta: 0.0, temp_lim: 0.0, steps_per_rad: 0.0,
+        step_sin: 0.0, step_cos: 0.0, nx: f64[], ny: f64[], out_x: i64[], out_y: i64[],
+        solution: XY[], join: JOIN_BEVEL, end: END_POLYGON, miter_limit: miter_limit,
+        arc_tolerance: arc_tolerance, preserve_collinear: false, reverse_solution: false
+    };
+}
+// glibc-compatible enough acos via atan2 (the reference calls std::acos once per group).
+fn acos(x: f64) -> f64 {
+    return math::atan2(((1.0 - x) * (1.0 + x)).sqrt(), x);
+}
+// Area<int64_t>(Path64) exactly as clipper.core.h pairs its terms.
+fn path_area<a>(p: (&a XY)) -> f64 {
+    cnt := p.x.len();
+    if cnt < 3 {
+        return 0.0;
+    }
+    mut a = 0.0;
+    mut it2 = cnt - 1;
+    mut stop = it2;
+    if (cnt & 1) == 0 {
+        stop += 1;
+    }
+    mut it1: u64 = 0;
+    while it1 != stop {
+        a += f64(p.y[it2] + p.y[it1]) * f64(p.x[it2] - p.x[it1]);
+        it2 = it1 + 1;
+        a += f64(p.y[it1] + p.y[it2]) * f64(p.x[it1] - p.x[it2]);
+        it1 += 2;
+    }
+    if (cnt & 1) != 0 {
+        a += f64(p.y[it2] + p.y[it1]) * f64(p.x[it2] - p.x[it1]);
+    }
+    return a * 0.5;
+}
+// std::unique, then (closed paths) trailing points equal to the first are dropped.
+fn strip_duplicates(p: XY, closed: bool) -> XY {
+    mut out = XY { x: i64[], y: i64[] };
+    for i in p.x.len() {
+        n := out.x.len();
+        if (n > 0) && (out.x[n - 1] == p.x[i]) && (out.y[n - 1] == p.y[i]) {
+            continue;
+        }
+        out.x.push(p.x[i]);
+        out.y.push(p.y[i]);
+    }
+    if closed {
+        while (out.x.len() > 1) && (out.x[out.x.len() - 1] == out.x[0]) && (out.y[out.y.len() - 1] == out.y[0]) {
+            out.x.pop();
+            out.y.pop();
+        }
+    }
+    return out;
+}
+fn add_group<a>(o: (&a mut Offset), paths: XY[], join: u64, end: u64) {
+    closed := (end == END_POLYGON) || (end == END_JOINED);
+    mut ps = XY[];
+    mut rest = paths;
+    mut tmp = XY[];
+    while rest.len() > 0 {
+        tmp.push(rest.pop());
+    }
+    while tmp.len() > 0 {
+        ps.push(strip_duplicates(tmp.pop(), closed));
+    }
+    mut lowest = NIL;
+    mut reversed = false;
+    if end == END_POLYGON {
+        // GetLowestClosedPathInfo
+        mut bx: i64 = 9223372036854775807;
+        mut by: i64 = -9223372036854775807 - 1;
+        mut neg = false;
+        for i in ps.len() {
+            mut a = dbl_max();
+            for j in ps[i].x.len() {
+                px := ps[i].x[j];
+                py := ps[i].y[j];
+                if (py < by) || ((py == by) && (px >= bx)) {
+                    continue;
+                }
+                if a == dbl_max() {
+                    a = path_area(&ps[i]);
+                    if a == 0.0 {
+                        break;
+                    }
+                    neg = a < 0.0;
+                }
+                lowest = i;
+                bx = px;
+                by = py;
+            }
+        }
+        reversed = (lowest != NIL) && neg;
+    }
+    o.groups.push(Group { paths: ps, lowest: lowest, reversed: reversed, join: join, end: end });
+}
+fn build_normals<a, b>(o: (&a mut Offset), p: (&b XY)) {
+    o.nx = f64[];
+    o.ny = f64[];
+    n := p.x.len();
+    if n == 0 {
+        return ();
+    }
+    for i in n {
+        mut j = i + 1;
+        if j == n {
+            j = 0;
+        }
+        un := unit_normal(Pt { x: p.x[i], y: p.y[i] }, Pt { x: p.x[j], y: p.y[j] });
+        o.nx.push(un.x);
+        o.ny.push(un.y);
+    }
+}
+struct V2 {
+    x: f64,
+    y: f64
+}
+fn hypot(x: f64, y: f64) -> f64 {
+    return (x * x + y * y).sqrt();
+}
+fn unit_normal(p1: Pt, p2: Pt) -> V2 {
+    if (p1.x == p2.x) && (p1.y == p2.y) {
+        return V2 { x: 0.0, y: 0.0 };
+    }
+    mut dx = f64(p2.x - p1.x);
+    mut dy = f64(p2.y - p1.y);
+    inv := 1.0 / hypot(dx, dy);
+    dx = dx * inv;
+    dy = dy * inv;
+    return V2 { x: dy, y: 0.0 - dx };
+}
+fn normalize(v: V2) -> V2 {
+    h := hypot(v.x, v.y);
+    if h.abs() < 0.001 {
+        return V2 { x: 0.0, y: 0.0 };
+    }
+    inv := 1.0 / h;
+    return V2 { x: v.x * inv, y: v.y * inv };
+}
+fn emit_pt<a>(o: (&a mut Offset), x: f64, y: f64) {
+    o.out_x.push(round_away(x));
+    o.out_y.push(round_away(y));
+}
+fn emit_int<a>(o: (&a mut Offset), x: i64, y: i64) {
+    o.out_x.push(x);
+    o.out_y.push(y);
+}
+fn do_bevel<a, b>(o: (&a mut Offset), p: (&b XY), j: u64, k: u64) {
+    px := f64(p.x[j]);
+    py := f64(p.y[j]);
+    if j == k {
+        ad := o.group_delta.abs();
+        x1 := px - ad * o.nx[j];
+        y1 := py - ad * o.ny[j];
+        x2 := px + ad * o.nx[j];
+        y2 := py + ad * o.ny[j];
+        emit_pt(&mut o, x1, y1);
+        emit_pt(&mut o, x2, y2);
+    } else {
+        g := o.group_delta;
+        x1 := px + g * o.nx[k];
+        y1 := py + g * o.ny[k];
+        x2 := px + g * o.nx[j];
+        y2 := py + g * o.ny[j];
+        emit_pt(&mut o, x1, y1);
+        emit_pt(&mut o, x2, y2);
+    }
+}
+// GetLineIntersectPt on PointD (non-hi-precision): clamps t to the first segment.
+struct Seg {
+    ax: f64,
+    ay: f64,
+    bx: f64,
+    by: f64
+}
+fn line_intersect_d(l1: Seg, l2: Seg, fallback: V2) -> V2 {
+    dx1 := l1.bx - l1.ax;
+    dy1 := l1.by - l1.ay;
+    dx2 := l2.bx - l2.ax;
+    dy2 := l2.by - l2.ay;
+    det := dy1 * dx2 - dy2 * dx1;
+    if det == 0.0 {
+        return fallback;
+    }
+    t := ((l1.ax - l2.ax) * dy2 - (l1.ay - l2.ay) * dx2) / det;
+    if t <= 0.0 {
+        return V2 { x: l1.ax, y: l1.ay };
+    }
+    if t >= 1.0 {
+        return V2 { x: l1.bx, y: l1.by };
+    }
+    return V2 { x: l1.ax + t * dx1, y: l1.ay + t * dy1 };
+}
+fn do_square<a, b>(o: (&a mut Offset), p: (&b XY), j: u64, k: u64) {
+    mut vec = V2 { x: 0.0, y: 0.0 };
+    if j == k {
+        vec = V2 { x: o.ny[j], y: 0.0 - o.nx[j] };
+    } else {
+        vec = normalize(V2 { x: (0.0 - o.ny[k]) + o.ny[j], y: o.nx[k] + (0.0 - o.nx[j]) });
+    }
+    ad := o.group_delta.abs();
+    g := o.group_delta;
+    qx := f64(p.x[j]) + ad * vec.x;
+    qy := f64(p.y[j]) + ad * vec.y;
+    p1x := qx + g * vec.y;
+    p1y := qy + g * (0.0 - vec.x);
+    p2x := qx + g * (0.0 - vec.y);
+    p2y := qy + g * vec.x;
+    p3x := f64(p.x[k]) + o.nx[k] * g;
+    p3y := f64(p.y[k]) + o.ny[k] * g;
+    if j == k {
+        p4x := p3x + vec.x * g;
+        p4y := p3y + vec.y * g;
+        pt := line_intersect_d(Seg { ax: p1x, ay: p1y, bx: p2x, by: p2y }, Seg { ax: p3x, ay: p3y, bx: p4x, by: p4y }, V2 { x: qx, y: qy });
+        emit_pt(&mut o, qx + (qx - pt.x), qy + (qy - pt.y));
+        emit_pt(&mut o, pt.x, pt.y);
+    } else {
+        p4x := f64(p.x[j]) + o.nx[k] * g;
+        p4y := f64(p.y[j]) + o.ny[k] * g;
+        pt := line_intersect_d(Seg { ax: p1x, ay: p1y, bx: p2x, by: p2y }, Seg { ax: p3x, ay: p3y, bx: p4x, by: p4y }, V2 { x: qx, y: qy });
+        emit_pt(&mut o, pt.x, pt.y);
+        emit_pt(&mut o, qx + (qx - pt.x), qy + (qy - pt.y));
+    }
+}
+fn do_miter<a, b>(o: (&a mut Offset), p: (&b XY), j: u64, k: u64, cos_a: f64) {
+    q := o.group_delta / (cos_a + 1.0);
+    x := f64(p.x[j]) + (o.nx[k] + o.nx[j]) * q;
+    y := f64(p.y[j]) + (o.ny[k] + o.ny[j]) * q;
+    emit_pt(&mut o, x, y);
+}
+fn do_round<a, b>(o: (&a mut Offset), p: (&b XY), j: u64, k: u64, angle: f64) {
+    px := p.x[j];
+    py := p.y[j];
+    g := o.group_delta;
+    mut vx = o.nx[k] * g;
+    mut vy = o.ny[k] * g;
+    if j == k {
+        vx = 0.0 - vx;
+        vy = 0.0 - vy;
+    }
+    emit_pt(&mut o, f64(px) + vx, f64(py) + vy);
+    steps := i64(math::ceil(o.steps_per_rad * angle.abs()));
+    mut i: i64 = 1;
+    while i < steps {
+        nvx := vx * o.step_cos - o.step_sin * vy;
+        nvy := vx * o.step_sin + vy * o.step_cos;
+        vx = nvx;
+        vy = nvy;
+        emit_pt(&mut o, f64(px) + vx, f64(py) + vy);
+        i += 1;
+    }
+    // GetPerpendic(path[j], norms[j], delta)
+    x := f64(px) + o.nx[j] * g;
+    y := f64(py) + o.ny[j] * g;
+    emit_pt(&mut o, x, y);
+}
+fn offset_point<a, b>(o: (&a mut Offset), p: (&b XY), j: u64, k: u64) {
+    if (p.x[j] == p.x[k]) && (p.y[j] == p.y[k]) {
+        return ();
+    }
+    // CrossProduct(vec1, vec2) = vec1.y*vec2.x - vec2.y*vec1.x; DotProduct = x*x + y*y
+    mut sin_a = o.ny[j] * o.nx[k] - o.ny[k] * o.nx[j];
+    cos_a := o.nx[j] * o.nx[k] + o.ny[j] * o.ny[k];
+    if sin_a > 1.0 {
+        sin_a = 1.0;
+    } else {
+        if sin_a < -1.0 {
+            sin_a = -1.0;
+        }
+    }
+    g := o.group_delta;
+    if g.abs() <= FP_TOL {
+        emit_int(&mut o, p.x[j], p.y[j]);
+        return ();
+    }
+    if (cos_a > -0.999) && (sin_a * g < 0.0) {
+        x1 := f64(p.x[j]) + o.nx[k] * g;
+        y1 := f64(p.y[j]) + o.ny[k] * g;
+        emit_pt(&mut o, x1, y1);
+        emit_int(&mut o, p.x[j], p.y[j]);
+        x2 := f64(p.x[j]) + o.nx[j] * g;
+        y2 := f64(p.y[j]) + o.ny[j] * g;
+        emit_pt(&mut o, x2, y2);
+        return ();
+    }
+    if (cos_a > 0.999) && (o.join != JOIN_ROUND) {
+        do_miter(&mut o, &p, j, k, cos_a);
+        return ();
+    }
+    if o.join == JOIN_MITER {
+        if cos_a > o.temp_lim - 1.0 {
+            do_miter(&mut o, &p, j, k, cos_a);
+        } else {
+            do_square(&mut o, &p, j, k);
+        }
+        return ();
+    }
+    if o.join == JOIN_ROUND {
+        do_round(&mut o, &p, j, k, math::atan2(sin_a, cos_a));
+        return ();
+    }
+    if o.join == JOIN_BEVEL {
+        do_bevel(&mut o, &p, j, k);
+        return ();
+    }
+    do_square(&mut o, &p, j, k);
+}
+fn take_out<a>(o: (&a mut Offset)) {
+    xs := exchange(&mut o.out_x, i64[]);
+    ys := exchange(&mut o.out_y, i64[]);
+    o.solution.push(XY { x: xs, y: ys });
+}
+fn offset_polygon<a, b>(o: (&a mut Offset), p: (&b XY)) {
+    o.out_x = i64[];
+    o.out_y = i64[];
+    n := p.x.len();
+    mut k = n - 1;
+    for j in n {
+        offset_point(&mut o, &p, j, k);
+        k = j;
+    }
+    take_out(&mut o);
+}
+fn offset_open_joined<a, b>(o: (&a mut Offset), p: (&b XY)) {
+    offset_polygon(&mut o, &p);
+    mut rx = i64[];
+    mut ry = i64[];
+    mut i = p.x.len();
+    while i > 0 {
+        i -= 1;
+        rx.push(p.x[i]);
+        ry.push(p.y[i]);
+    }
+    rev := XY { x: rx, y: ry };
+    // reverse norms, rotate left by one, negate
+    mut nx = f64[];
+    mut ny = f64[];
+    mut m = o.nx.len();
+    while m > 0 {
+        m -= 1;
+        nx.push(o.nx[m]);
+        ny.push(o.ny[m]);
+    }
+    mut fx = f64[];
+    mut fy = f64[];
+    for t in nx.len() {
+        mut s = t + 1;
+        if s == nx.len() {
+            s = 0;
+        }
+        fx.push(0.0 - nx[s]);
+        fy.push(0.0 - ny[s]);
+    }
+    o.nx = fx;
+    o.ny = fy;
+    offset_polygon(&mut o, &rev);
+}
+fn offset_cap<a, b>(o: (&a mut Offset), p: (&b XY), i: u64) {
+    if o.group_delta.abs() <= FP_TOL {
+        emit_int(&mut o, p.x[i], p.y[i]);
+        return ();
+    }
+    if o.end == END_BUTT {
+        do_bevel(&mut o, &p, i, i);
+    } else {
+        if o.end == END_ROUND {
+            do_round(&mut o, &p, i, i, PI);
+        } else {
+            do_square(&mut o, &p, i, i);
+        }
+    }
+}
+fn offset_open_path<a, b>(o: (&a mut Offset), p: (&b XY)) {
+    offset_cap(&mut o, &p, 0);
+    high := p.x.len() - 1;
+    mut k: u64 = 0;
+    mut j: u64 = 1;
+    while j < high {
+        offset_point(&mut o, &p, j, k);
+        k = j;
+        j += 1;
+    }
+    mut i = high;
+    while i > 0 {
+        ax := 0.0 - o.nx[i - 1];
+        ay := 0.0 - o.ny[i - 1];
+        o.nx[i] = ax;
+        o.ny[i] = ay;
+        i -= 1;
+    }
+    hx := o.nx[high];
+    hy := o.ny[high];
+    o.nx[0] = hx;
+    o.ny[0] = hy;
+    offset_cap(&mut o, &p, high);
+    mut j2 = high - 1;
+    mut k2 = high;
+    while j2 > 0 {
+        offset_point(&mut o, &p, j2, k2);
+        k2 = j2;
+        j2 -= 1;
+    }
+    take_out(&mut o);
+}
+fn ellipse_int(cx: i64, cy: i64, radius: f64, steps_in: u64) -> XY {
+    mut out = XY { x: i64[], y: i64[] };
+    if radius <= 0.0 {
+        return out;
+    }
+    mut steps = steps_in;
+    if steps <= 2 {
+        steps = u64(PI * ((radius + radius) / 2.0).sqrt());
+    }
+    si := math::sin(2.0 * PI / f64(steps));
+    co := math::cos(2.0 * PI / f64(steps));
+    mut dx = co;
+    mut dy = si;
+    out.x.push(round_away(f64(cx) + radius));
+    out.y.push(round_away(f64(cy)));
+    mut i: u64 = 1;
+    while i < steps {
+        out.x.push(round_away(f64(cx) + radius * dx));
+        out.y.push(round_away(f64(cy) + radius * dy));
+        x := dx * co - dy * si;
+        dy = dy * co + dx * si;
+        dx = x;
+        i += 1;
+    }
+    return out;
+}
+fn do_group_offset<a>(o: (&a mut Offset), gi: u64) {
+    gend := o.groups[gi].end;
+    gjoin := o.groups[gi].join;
+    if gend == END_POLYGON {
+        if o.groups[gi].lowest == NIL {
+            o.delta = o.delta.abs();
+        }
+        if o.groups[gi].reversed {
+            o.group_delta = 0.0 - o.delta;
+        } else {
+            o.group_delta = o.delta;
+        }
+    } else {
+        o.group_delta = o.delta.abs();
+    }
+    abs_delta := o.group_delta.abs();
+    o.join = gjoin;
+    o.end = gend;
+    if (gjoin == JOIN_ROUND) || (gend == END_ROUND) {
+        mut arc_tol = abs_delta * ARC_CONST;
+        if o.arc_tolerance > FP_TOL {
+            arc_tol = o.arc_tolerance;
+            if abs_delta < arc_tol {
+                arc_tol = abs_delta;
+            }
+        }
+        mut steps_per_360 = PI / acos(1.0 - arc_tol / abs_delta);
+        if abs_delta * PI < steps_per_360 {
+            steps_per_360 = abs_delta * PI;
+        }
+        o.step_sin = math::sin(2.0 * PI / steps_per_360);
+        o.step_cos = math::cos(2.0 * PI / steps_per_360);
+        if o.group_delta < 0.0 {
+            o.step_sin = 0.0 - o.step_sin;
+        }
+        o.steps_per_rad = steps_per_360 / (2.0 * PI);
+    }
+    np := o.groups[gi].paths.len();
+    for pi in np {
+        p := copy_xy(&o.groups[gi].paths[pi]);
+        n := p.x.len();
+        o.out_x = i64[];
+        o.out_y = i64[];
+        if n == 1 {
+            if o.group_delta < 1.0 {
+                continue;
+            }
+            if gjoin == JOIN_ROUND {
+                mut steps: u64 = 0;
+                if o.steps_per_rad > 0.0 {
+                    steps = u64(math::ceil(o.steps_per_rad * 2.0 * PI));
+                }
+                o.solution.push(ellipse_int(p.x[0], p.y[0], abs_delta, steps));
+            } else {
+                d := i64(math::ceil(abs_delta));
+                o.solution.push(XY { x: i64[p.x[0] - d, p.x[0] + d, p.x[0] + d, p.x[0] - d], y: i64[p.y[0] - d, p.y[0] - d, p.y[0] + d, p.y[0] + d] });
+            }
+            continue;
+        }
+        if (n == 2) && (gend == END_JOINED) {
+            if gjoin == JOIN_ROUND {
+                o.end = END_ROUND;
+            } else {
+                o.end = END_SQUARE;
+            }
+        }
+        build_normals(&mut o, &p);
+        if o.end == END_POLYGON {
+            offset_polygon(&mut o, &p);
+        } else {
+            if o.end == END_JOINED {
+                offset_open_joined(&mut o, &p);
+            } else {
+                offset_open_path(&mut o, &p);
+            }
+        }
+    }
+}
+fn copy_xy<a>(p: (&a XY)) -> XY {
+    mut out = XY { x: i64[], y: i64[] };
+    for i in p.x.len() {
+        out.x.push(p.x[i]);
+        out.y.push(p.y[i]);
+    }
+    return out;
+}
+fn offset_execute<a>(o: (&a mut Offset), delta: f64) -> XY[] {
+    o.solution = XY[];
+    if o.groups.len() == 0 {
+        return XY[];
+    }
+    if delta.abs() < 0.5 {
+        for g in o.groups.len() {
+            for i in o.groups[g].paths.len() {
+                cp := copy_xy(&o.groups[g].paths[i]);
+                o.solution.push(cp);
+            }
+        }
+    } else {
+        if o.miter_limit <= 1.0 {
+            o.temp_lim = 2.0;
+        } else {
+            o.temp_lim = 2.0 / (o.miter_limit * o.miter_limit);
+        }
+        o.delta = delta;
+        for g in o.groups.len() {
+            do_group_offset(&mut o, g);
+        }
+    }
+    if o.solution.len() == 0 {
+        return XY[];
+    }
+    mut paths_reversed = false;
+    for g in o.groups.len() {
+        if o.groups[g].end == END_POLYGON {
+            paths_reversed = o.groups[g].reversed;
+            break;
+        }
+    }
+    mut c = new();
+    c.preserve_collinear = o.preserve_collinear;
+    c.reverse_solution = o.reverse_solution != paths_reversed;
+    sol := exchange(&mut o.solution, XY[]);
+    add_paths_(&mut c, &sol, SUBJECT, false);
+    mut fill = FILL_POSITIVE;
+    if paths_reversed {
+        fill = FILL_NEGATIVE;
+    }
+    raw := execute(&mut c, CLIP_UNION, fill);
+    mut out = XY[];
+    for i in raw.len() {
+        out.push(XY { x: copy_i64(&raw[i].x), y: copy_i64(&raw[i].y) });
+    }
+    return out;
+}
+fn copy_i64<a>(v: (&a i64[])) -> i64[] {
+    mut out = i64[];
+    for i in v.len() {
+        out.push(v[i]);
+    }
+    return out;
+}
+// Clipper2 InflatePaths(PathsD, delta, jt, et, miter_limit, precision, arc_tolerance).
+pub struct OffsetOptions {
+    miter_limit: f64,
+    precision: u64,
+    arc_tolerance: f64
+}
+pub fn inflate_paths_d(paths: PathD[], delta: f64, join: u64, end: u64, opts: OffsetOptions) -> PathD[] {
+    if delta == 0.0 {
+        return paths;
+    }
+    mut scale = 1.0;
+    for i in opts.precision {
+        scale = scale * 10.0;
+    }
+    mut o = new_offset(opts.miter_limit, opts.arc_tolerance * scale);
+    xy := scale_in(paths, scale);
+    if xy.len() == 0 {
+        return PathD[];
+    }
+    add_group(&mut o, xy, join, end);
+    sol := offset_execute(&mut o, delta * scale);
+    inv := 1.0 / scale;
+    mut out = PathD[];
+    for i in sol.len() {
+        mut xs = f64[];
+        mut ys = f64[];
+        for j in sol[i].x.len() {
+            xs.push(f64(sol[i].x[j]) * inv);
+            ys.push(f64(sol[i].y[j]) * inv);
+        }
+        out.push(PathD { x: xs, y: ys });
+    }
+    return out;
+}
