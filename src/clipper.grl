@@ -351,7 +351,7 @@ fn cmp_products(a: i64, b: i64, c: i64, d: i64) -> i64 {
 fn products_equal(a: i64, b: i64, c: i64, d: i64) -> bool {
     return cmp_products(a, b, c, d) == 0;
 }
-// Points are passed as x/y pairs packed in Pt to stay within six parameters.
+// An integer point (Clipper2's Point64).
 pub struct Pt {
     x: i64,
     y: i64
@@ -3358,7 +3358,7 @@ fn check_bounds<a>(c: (&a mut Clip), rec: u64) -> bool {
     return true;
 }
 fn check_split_owner<a>(c: (&a mut Clip), rec: u64, splits_of: u64) -> bool {
-    splits := copy_u64s(&c.r_splits[splits_of]);
+    splits := c.r_splits[splits_of].copy();
     for idx in splits.len() {
         mut sp = splits[idx];
         if (c.r_pts[sp] == NIL) && (c.r_splits[sp].len() != 0) && check_split_owner(&mut c, rec, sp) {
@@ -3384,13 +3384,6 @@ fn check_split_owner<a>(c: (&a mut Clip), rec: u64, splits_of: u64) -> bool {
         return true;
     }
     return false;
-}
-fn copy_u64s<a>(v: (&a u64[])) -> u64[] {
-    mut out = u64[];
-    for i in v.len() {
-        out.push(v[i]);
-    }
-    return out;
 }
 fn recursive_check_owners<a, b>(c: (&a mut Clip), rec: u64, tree: (&b mut Tree), inv: f64) {
     if (c.r_polypath[rec] != NIL) || rect_empty(&c, rec) {
