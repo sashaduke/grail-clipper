@@ -1375,11 +1375,8 @@ fn pop_horz<a>(c: (&a mut Clip)) -> u64 {
     return e;
 }
 
-// Appends to an outrec's split list (nested vectors are updated by taking them out).
 fn push_split<a>(c: (&a mut Clip), rec: u64, v: u64) {
-    mut list = exchange(&mut c.r_splits[rec], u64[]);
-    list.push(v);
-    exchange(&mut c.r_splits[rec], list);
+    c.r_splits[rec].push(v);
 }
 fn new_outrec<a>(c: (&a mut Clip)) -> u64 {
     n := c.r_owner.len();
